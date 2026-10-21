@@ -1,0 +1,24 @@
+# macOS and local IDE settings
+.DS_Store
+/.idea/
+/.vscode/
+
+# Swift and app build outputs
+/.build/
+/.swiftpm/
+/build/
+/dist/
+*.dSYM/
+*.dSYM.zip
+
+# Local account state, logs and private signing material
+/.codex/
+auth.json
+greetings.json
+greetings.lock
+*.log
+.env
+.env.*
+*.p12
+*.pfx
+*.key
