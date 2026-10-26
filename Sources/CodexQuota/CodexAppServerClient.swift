@@ -4,7 +4,7 @@ import Foundation
 /// Local bounded logger that preserves complete JSON-RPC lines without unified-log truncation.
 private let codexRPCLog = RPCFileLogger.shared
 
-/// Performs one bounded, read-only reset-credit query through Codex App Server.
+/// Performs bounded reset-credit queries and explicitly authorized, idempotent card consumption.
 final class CodexAppServerClient {
   /// File manager used to discover executable candidates without invoking a shell.
   private let fileManager: FileManager
@@ -16,18 +16,84 @@ final class CodexAppServerClient {
 
   /// Starts App Server, reads the account-bound credit snapshot, and always stops the child.
   func readResetCredits(auth: CodexAuth) throws -> ResetCreditsSnapshot {
+    try withSession(auth: auth) { session in
+      _ = try readAccount(session: session)
+      return try parseCredits(readRateLimits(session: session, auth: auth))
+    }
+  }
+
+  /// Revalidates login and the latest card list in the same child before using one specific card.
+  /// Reconciliation always reuses the original card/key even if the card vanished or expired.
+  /// The authorization callback durably records intent and transmits under the coordinator lock,
+  /// so disabling or editing settings cannot race a not-yet-submitted consume request.
+  func consumeResetCredit(
+    auth: CodexAuth, identity: CodexAutoUseIdentity, creditID: String,
+    idempotencyKey: String, leadMinutes: Int, reconciling: Bool,
+    cancellation: ResetCreditConsumptionCancellation,
+    authorizeSend: @escaping (_ transmit: () throws -> Void) throws -> Void
+  ) throws -> ResetCreditConsumeOutcome {
+    guard !cancellation.isCancelled else { throw CodexQuotaError.transport("自动使用已停止") }
+    return try withSession(
+      auth: auth, diagnostics: ResetCreditAutoUseCoordinator.log, cancellation: cancellation
+    ) { session in
+      let currentIdentity = try CodexAuthStore().autoUseIdentity(for: auth)
+      guard currentIdentity.key == identity.key, currentIdentity.authPath == identity.authPath else {
+        throw CodexQuotaError.transport("Codex 账号已切换")
+      }
+      let account = try readAccount(session: session)
+      guard let email = account["email"] as? String,
+        email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == identity.email
+      else {
+        throw CodexQuotaError.transport("Codex App Server 登录身份不一致")
+      }
+      let snapshot = try parseCredits(readRateLimits(session: session, auth: auth))
+      let expiresAt = snapshot.items.first(where: { $0.id == creditID })?.expiresAt
+      let result = try session.call(
+        method: "account/rateLimitResetCredit/consume",
+        params: ["creditId": creditID, "idempotencyKey": idempotencyKey],
+        authorizeSend: { transmit in
+          if !reconciling {
+            guard snapshot.availableCount > 0, let expiresAt,
+              expiresAt.timeIntervalSinceNow > 0,
+              expiresAt.timeIntervalSinceNow <= TimeInterval(leadMinutes * 60)
+            else {
+              throw CodexQuotaError.transport("该重置卡已不可用、已过期或尚未到自动使用时间")
+            }
+          }
+          try authorizeSend(transmit)
+        }
+      )
+      guard let raw = result["outcome"] as? String,
+        let outcome = ResetCreditConsumeOutcome(rawValue: raw)
+      else {
+        throw CodexQuotaError.invalidResponse
+      }
+      return outcome
+    }
+  }
+
+  /// Creates and initializes one bounded child; all callers share shutdown and diagnostic rules.
+  /// Automatic operations mirror every RPC and child diagnostic to their dedicated private log.
+  private func withSession<T>(
+    auth: CodexAuth, diagnostics: RPCFileLogger? = nil,
+    cancellation: ResetCreditConsumptionCancellation? = nil,
+    body: (AppServerSession) throws -> T
+  ) throws -> T {
     let executable = try locateExecutable()
     let session = try AppServerSession(
       executableURL: URL(fileURLWithPath: executable),
       arguments: arguments(for: auth),
-      environment: sanitizedEnvironment(authPath: auth.authPath)
+      environment: sanitizedEnvironment(authPath: auth.authPath),
+      diagnostics: diagnostics
     )
+    cancellation?.register { session.close(reason: "auto_use_shutdown") }
     let timeout = DispatchWorkItem {
       session.close(reason: "timeout")
     }
     DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 25, execute: timeout)
     defer {
       timeout.cancel()
+      cancellation?.clear()
       session.close()
     }
 
@@ -41,7 +107,11 @@ final class CodexAppServerClient {
       ]
     )
     try session.notify(method: "initialized", params: nil)
+    return try body(session)
+  }
 
+  /// Rejects API-key sessions without refreshing credentials or performing interactive login.
+  private func readAccount(session: AppServerSession) throws -> [String: Any] {
     let accountResult = try session.call(
       method: "account/read",
       params: ["refreshToken": false]
@@ -52,6 +122,11 @@ final class CodexAppServerClient {
       throw CodexQuotaError.notSignedIn
     }
 
+    return account
+  }
+
+  /// Checks the optional upstream workspace field against the child process's pinned workspace.
+  private func readRateLimits(session: AppServerSession, auth: CodexAuth) throws -> [String: Any] {
     let result = try session.call(method: "account/rateLimits/read", params: nil)
     if let responseAccountID = result["accountId"] as? String,
       !responseAccountID.isEmpty,
@@ -59,7 +134,7 @@ final class CodexAppServerClient {
     {
       throw CodexQuotaError.transport("Codex 账户已切换")
     }
-    return try parseCredits(result)
+    return result
   }
 
   /// Builds the least-privilege App Server command line without placing credentials in argv.
@@ -199,6 +274,12 @@ final class CodexAppServerClient {
 
 /// Owns one newline-delimited JSON-RPC child process and its deterministic shutdown.
 private final class AppServerSession {
+  /// Correlation identity disambiguating repeated numeric RPC IDs from different CLI children.
+  private let sessionID = UUID().uuidString
+
+  /// Optional dedicated auto-use log receiving the same complete request and response records.
+  private let diagnostics: RPCFileLogger?
+
   /// Child Codex process serving JSON-RPC over native pipes.
   private let process: Process
 
@@ -233,7 +314,11 @@ private final class AppServerSession {
   private var isClosed = false
 
   /// Launches a shell-free App Server process in the system temporary directory.
-  init(executableURL: URL, arguments: [String], environment: [String: String]) throws {
+  init(
+    executableURL: URL, arguments: [String], environment: [String: String],
+    diagnostics: RPCFileLogger? = nil
+  ) throws {
+    self.diagnostics = diagnostics
     let inputPipe = Pipe()
     let outputPipe = Pipe()
     process = Process()
@@ -273,7 +358,10 @@ private final class AppServerSession {
   }
 
   /// Sends one request and returns its result object while faithfully logging JSON and errors.
-  func call(method: String, params: Any?) throws -> [String: Any] {
+  func call(
+    method: String, params: Any?,
+    authorizeSend: ((_ transmit: () throws -> Void) throws -> Void)? = nil
+  ) throws -> [String: Any] {
     nextID += 1
     let requestID = nextID
     let request: [String: Any] = [
@@ -285,6 +373,7 @@ private final class AppServerSession {
     let requestJSON = String(data: encoded, encoding: .utf8) ?? "{}"
     var responseJSON: String?
     var requestError: Error?
+    let startedAt = Date()
     defer {
       codexRPCLog.write(kind: "request", payload: requestJSON)
       if let responseJSON {
@@ -293,10 +382,22 @@ private final class AppServerSession {
       if let requestError {
         codexRPCLog.write(kind: "error", payload: requestError.localizedDescription)
       }
+      logRPC(
+        event: "rpc_finished", method: method, requestID: requestID,
+        requestJSON: requestJSON, responseJSON: responseJSON, error: requestError,
+        duration: Date().timeIntervalSince(startedAt)
+      )
     }
 
     do {
-      try write(encoded)
+      logRPC(
+        event: "rpc_started", method: method, requestID: requestID, requestJSON: requestJSON
+      )
+      if let authorizeSend {
+        try authorizeSend { try self.write(encoded) }
+      } else {
+        try write(encoded)
+      }
       while true {
         let message = try readMessage()
         guard let id = (message.object["id"] as? NSNumber)?.intValue else {
@@ -313,7 +414,7 @@ private final class AppServerSession {
         if let rpcError = message.object["error"] as? [String: Any] {
           let code = (rpcError["code"] as? NSNumber)?.intValue ?? 0
           let text = rpcError["message"] as? String ?? "RPC \(code)"
-          throw CodexQuotaError.transport(text)
+          throw CodexQuotaError.rpc(code: code, message: text)
         }
         guard let result = message.object["result"] as? [String: Any] else {
           throw CodexQuotaError.invalidResponse
@@ -340,6 +441,10 @@ private final class AppServerSession {
       if let requestError {
         codexRPCLog.write(kind: "error", payload: requestError.localizedDescription)
       }
+      logRPC(
+        event: "rpc_notification", method: method, requestID: nil,
+        requestJSON: requestJSON, error: requestError
+      )
     }
     do {
       try write(encoded)
@@ -387,7 +492,7 @@ private final class AppServerSession {
   /// Writes one JSON diagnostic record after exit, without logging credentials or environment values.
   /// Retains the final 256 KiB of unusually large stderr output and explicitly reports truncation.
   private func logDiagnostics(reason: String, error: Error?) {
-    var diagnostics = ""
+    var stderr = ""
     var byteCount: UInt64 = 0
     var readError: Error?
     let maximumBytes: UInt64 = 262_144
@@ -396,11 +501,12 @@ private final class AppServerSession {
       defer { try? handle.close() }
       byteCount = try handle.seekToEnd()
       try handle.seek(toOffset: byteCount > maximumBytes ? byteCount - maximumBytes : 0)
-      diagnostics = String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self)
+      stderr = String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self)
     } catch {
       readError = error
     }
     let record: [String: Any] = [
+      "sessionID": sessionID,
       "executable": process.executableURL?.path ?? "",
       "pid": hasLaunched ? Int(process.processIdentifier) as Any : NSNull(),
       "exitCode": hasLaunched ? Int(process.terminationStatus) as Any : NSNull(),
@@ -409,7 +515,7 @@ private final class AppServerSession {
       "shutdownReason": reason,
       "timedOut": reason == "timeout",
       "durationSeconds": Date().timeIntervalSince(startedAt),
-      "stderr": diagnostics,
+      "stderr": stderr,
       "stderrByteCount": byteCount,
       "stderrTruncated": byteCount > maximumBytes,
       "stderrReadError": readError.map { $0.localizedDescription as Any } ?? NSNull(),
@@ -419,7 +525,31 @@ private final class AppServerSession {
       let json = String(data: data, encoding: .utf8)
     {
       codexRPCLog.write(kind: "app_server", payload: json)
+      diagnostics?.write(kind: "app_server", payload: json)
     }
+  }
+
+  /// Logs faithful wire JSON as strings, with session/request correlation and numeric RPC errors.
+  /// Called before transmission and from a defer installed before the RPC operation starts.
+  private func logRPC(
+    event: String, method: String, requestID: Int?, requestJSON: String,
+    responseJSON: String? = nil, error: Error? = nil, duration: TimeInterval? = nil
+  ) {
+    var record: [String: Any] = [
+      "event": event, "sessionID": sessionID, "method": method,
+      "requestID": requestID.map { $0 as Any } ?? NSNull(),
+      "requestJSON": requestJSON, "responseJSON": responseJSON.map { $0 as Any } ?? NSNull(),
+      "error": error.map { $0.localizedDescription as Any } ?? NSNull(),
+      "durationSeconds": duration.map { $0 as Any } ?? NSNull(),
+    ]
+    if let failure = error as? CodexQuotaError, case .rpc(let code, _) = failure {
+      record["rpcErrorCode"] = code
+    }
+    guard let data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]),
+      let json = String(data: data, encoding: .utf8)
+    else { return }
+    codexRPCLog.write(kind: "rpc", payload: json)
+    diagnostics?.write(kind: "rpc", payload: json)
   }
 
   /// Encodes a JSON object in stable key order so the logged request matches transmitted bytes.
@@ -499,8 +629,11 @@ private struct RPCMessage {
 final class RPCFileLogger {
   /// Serializes RPC and CLI diagnostics through one process-wide rotation lock.
   static let shared = RPCFileLogger()
-  /// Maximum retained byte count before the current file is moved to one previous generation.
-  private static let maximumBytes: UInt64 = 1_048_576
+  /// Maximum retained byte count before the current file is moved to the next generation.
+  private let maximumBytes: UInt64
+
+  /// Number of complete rotated generations retained for later failure investigation.
+  private let retainedGenerations: Int
 
   /// Lock that keeps request, response, and error lines from interleaving.
   private let lock = NSLock()
@@ -514,11 +647,16 @@ final class RPCFileLogger {
   /// ISO-8601 formatter used only while holding the logger lock.
   private let timestampFormatter: ISO8601DateFormatter
 
-  /// Creates a logger rooted at `~/Library/Logs/CodexQuota/rpc.log`.
-  init() {
+  /// Creates a configurable private log under `~/Library/Logs/CodexQuota`, defaulting to rpc.log.
+  init(
+    filename: String = "rpc.log", maximumBytes: UInt64 = 1_048_576,
+    retainedGenerations: Int = 1
+  ) {
+    self.maximumBytes = maximumBytes
+    self.retainedGenerations = max(1, retainedGenerations)
     let directory = fileManager.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Logs/CodexQuota", isDirectory: true)
-    logURL = directory.appendingPathComponent("rpc.log", isDirectory: false)
+    logURL = directory.appendingPathComponent(filename, isDirectory: false)
     timestampFormatter = ISO8601DateFormatter()
     timestampFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
   }
@@ -559,20 +697,73 @@ final class RPCFileLogger {
     }
   }
 
-  /// Rotates at most one previous generation before an append would grow an oversized file.
+  /// Rotates bounded complete generations without truncating a request/response JSON payload.
   private func rotateIfNeeded() throws {
     guard
       let attributes = try? fileManager.attributesOfItem(atPath: logURL.path),
       let size = attributes[.size] as? NSNumber,
-      size.uint64Value >= Self.maximumBytes
+      size.uint64Value >= maximumBytes
     else {
       return
     }
 
-    let previousURL = logURL.appendingPathExtension("1")
-    if fileManager.fileExists(atPath: previousURL.path) {
-      try fileManager.removeItem(at: previousURL)
+    let oldest = logURL.appendingPathExtension(String(retainedGenerations))
+    if fileManager.fileExists(atPath: oldest.path) {
+      try fileManager.removeItem(at: oldest)
     }
-    try fileManager.moveItem(at: logURL, to: previousURL)
+    if retainedGenerations > 1 {
+      for generation in stride(from: retainedGenerations - 1, through: 1, by: -1) {
+        let source = logURL.appendingPathExtension(String(generation))
+        if fileManager.fileExists(atPath: source.path) {
+          try fileManager.moveItem(
+            at: source, to: logURL.appendingPathExtension(String(generation + 1))
+          )
+        }
+      }
+    }
+    try fileManager.moveItem(at: logURL, to: logURL.appendingPathExtension("1"))
+  }
+}
+
+/// Thread-safe shutdown hook for the single bounded automatic-consumption child process.
+final class ResetCreditConsumptionCancellation {
+  /// Protects registration and cancellation without holding a lock during child teardown.
+  private let lock = NSLock()
+  /// Once cancelled, even a later registration closes its child immediately.
+  private var cancelled = false
+  /// Registered native child teardown, cleared when normal RPC cleanup finishes.
+  private var closeChild: (() -> Void)?
+
+  /// Reads cancellation state before launching any automatic child.
+  var isCancelled: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return cancelled
+  }
+
+  /// Installs cleanup and handles shutdown that happened before the child was launched.
+  func register(_ closeChild: @escaping () -> Void) {
+    lock.lock()
+    let shouldClose = cancelled
+    if !shouldClose { self.closeChild = closeChild }
+    lock.unlock()
+    if shouldClose { closeChild() }
+  }
+
+  /// Removes the completed child's cleanup closure without reopening a cancelled operation.
+  func clear() {
+    lock.lock()
+    closeChild = nil
+    lock.unlock()
+  }
+
+  /// Cancels queued work or synchronously closes an active child, preserving durable pending state.
+  func cancel() {
+    lock.lock()
+    cancelled = true
+    let cleanup = closeChild
+    closeChild = nil
+    lock.unlock()
+    cleanup?()
   }
 }

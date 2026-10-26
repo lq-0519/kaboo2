@@ -95,6 +95,24 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     title: "打开系统设置", target: nil, action: nil
   )
 
+  /// Independent default-off opt-in for actually consuming an expiring reset card.
+  private let creditAutoUseSwitch = NSSwitch()
+
+  /// Positive integer-minute lead, saved on Return or when editing ends.
+  private let creditAutoUseField = NSTextField()
+
+  /// Minute lead stepper with an exact one-minute increment.
+  private let creditAutoUseStepper = NSStepper()
+
+  /// Explains refresh cadence and the relationship between the chosen lead and check interval.
+  private let creditAutoUseHintLabel = NSTextField(wrappingLabelWithString: "")
+
+  /// Shows selection, success, deferred reconciliation, account change or storage failure.
+  private let creditAutoUseStatusLabel = NSTextField(wrappingLabelWithString: "")
+
+  /// Opens dedicated full RPC/decision logs for the user's own subsequent testing.
+  private let creditAutoUseLogButton = NSButton(title: "查看自动使用日志", target: nil, action: nil)
+
   /// Scrolls tall settings on smaller screens while keeping every native control reachable.
   private let settingsScrollView = NSScrollView()
 
@@ -227,6 +245,30 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     openCreditNotificationSettingsButton.controlSize = .small
     openCreditNotificationSettingsButton.isHidden = true
 
+    creditAutoUseSwitch.target = self
+    creditAutoUseSwitch.action = #selector(creditAutoUseSwitchChanged)
+    creditAutoUseSwitch.setAccessibilityLabel("自动使用重置卡")
+    configureNumberField(
+      creditAutoUseField, minimum: 1, maximum: ResetCreditAutoUseCoordinator.maximumLeadMinutes,
+      action: #selector(creditAutoUseMinutesCommitted)
+    )
+    configureStepper(
+      creditAutoUseStepper, minimum: 1,
+      maximum: Double(ResetCreditAutoUseCoordinator.maximumLeadMinutes), increment: 1,
+      action: #selector(creditAutoUseStepperChanged)
+    )
+    creditAutoUseField.setAccessibilityLabel("到期前自动使用分钟数")
+    creditAutoUseStepper.setAccessibilityLabel("到期前自动使用分钟数")
+    for label in [creditAutoUseHintLabel, creditAutoUseStatusLabel] {
+      label.font = .systemFont(ofSize: 11)
+      label.textColor = .secondaryLabelColor
+    }
+    creditAutoUseStatusLabel.maximumNumberOfLines = 5
+    creditAutoUseLogButton.target = self
+    creditAutoUseLogButton.action = #selector(creditAutoUseLogClicked)
+    creditAutoUseLogButton.bezelStyle = .rounded
+    creditAutoUseLogButton.controlSize = .small
+
     greetingSwitch.target = self
     greetingSwitch.action = #selector(greetingSwitchChanged)
     greetingHintLabel.font = .systemFont(ofSize: 11)
@@ -353,6 +395,21 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       [creditNotificationStatusLabel, trailingControls([openCreditNotificationSettingsButton])],
     ])
     creditNotificationFeedbackRow = creditReminderGrid.row(at: 3)
+    let creditAutoUseGrid = settingsGrid(rows: [
+      [settingLabel("自动使用重置卡"), trailingControls([creditAutoUseSwitch])],
+      [
+        settingLabel("到期前自动使用"),
+        numericControls(field: creditAutoUseField, stepper: creditAutoUseStepper, unit: "分钟"),
+      ],
+    ])
+    let creditAutoUseSection = NSStackView(views: [
+      creditAutoUseGrid, creditAutoUseHintLabel,
+      trailingControls([creditAutoUseLogButton]), creditAutoUseStatusLabel,
+    ])
+    creditAutoUseSection.orientation = .vertical
+    creditAutoUseSection.alignment = .leading
+    creditAutoUseSection.spacing = 9
+    creditAutoUseSection.setContentHuggingPriority(.required, for: .vertical)
     let greetingSection = NSStackView(views: [
       greetingGrid,
       greetingHintLabel,
@@ -406,6 +463,9 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
         sectionTitle("重置卡到期提醒"),
         creditReminderGrid,
         divider(),
+        sectionTitle("自动使用重置卡"),
+        creditAutoUseSection,
+        divider(),
         sectionTitle("自动问候"),
         greetingSection,
         divider(),
@@ -444,6 +504,10 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       stack.bottomAnchor.constraint(equalTo: settingsContentView.bottomAnchor, constant: -22),
       generalGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
       creditReminderGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      creditAutoUseSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      creditAutoUseGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      creditAutoUseHintLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      creditAutoUseStatusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
       greetingSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
       greetingGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
       greetingHintLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -455,6 +519,7 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       creditsIntervalField.widthAnchor.constraint(equalToConstant: 76),
       firstCreditReminderField.widthAnchor.constraint(equalToConstant: 54),
       secondCreditReminderField.widthAnchor.constraint(equalToConstant: 54),
+      creditAutoUseField.widthAnchor.constraint(equalToConstant: 76),
       fontSizePopup.widthAnchor.constraint(equalToConstant: 126),
       fiveHourStylePopup.widthAnchor.constraint(equalToConstant: 126),
       sevenDayStylePopup.widthAnchor.constraint(equalToConstant: 126),
@@ -468,6 +533,10 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     store.onNotificationChange = { [weak self] in
       guard let self, self.isViewLoaded else { return }
       self.renderNotifications()
+    }
+    store.onCreditAutoUseChange = { [weak self] in
+      guard let self, self.isViewLoaded else { return }
+      self.renderCreditAutoUse()
     }
     render()
   }
@@ -492,12 +561,19 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       commitCreditsInterval()
     } else if field === firstCreditReminderField || field === secondCreditReminderField {
       commitCreditReminderHours(field)
+    } else if field === creditAutoUseField {
+      commitCreditAutoUseMinutes()
     }
   }
 
   /// Synchronizes every control from persisted values and current macOS service state.
   private func render() {
     renderGreeting()
+    if creditAutoUseField.currentEditor() == nil {
+      creditAutoUseField.integerValue = store.creditAutoUseLeadMinutes
+      creditAutoUseStepper.integerValue = store.creditAutoUseLeadMinutes
+    }
+    renderCreditAutoUse()
     quotaIntervalField.integerValue = store.refreshIntervalSeconds
     quotaIntervalStepper.integerValue = store.refreshIntervalSeconds
     creditsIntervalField.integerValue = store.creditsRefreshIntervalMinutes
@@ -625,6 +701,72 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     reviewGreetingRow.isHidden = !store.resetGreetingNeedsReview
     reviewGreetingButton.isEnabled = !store.isSendingGreeting
     resizeToFitContents()
+  }
+
+  /// Updates async status and switch state without replacing an in-progress minute-field edit.
+  /// Cadence feedback makes the minute setting's relationship to periodic refresh explicit.
+  private func renderCreditAutoUse() {
+    creditAutoUseSwitch.state = store.creditAutoUseEnabled ? .on : .off
+    creditAutoUseSwitch.isEnabled = store.creditAutoUseAvailable
+    creditAutoUseField.isEnabled = store.creditAutoUseAvailable
+    creditAutoUseStepper.isEnabled = store.creditAutoUseAvailable
+    creditAutoUseStatusLabel.stringValue = store.creditAutoUseStatus
+    let interval = store.creditsRefreshIntervalMinutes
+    creditAutoUseHintLabel.stringValue =
+      "开启后自动使用即将到期的卡，每次最多一张；随重置卡刷新检查（当前每 \(interval) 分钟）。"
+    if store.creditAutoUseLeadMinutes <= interval {
+      creditAutoUseHintLabel.stringValue += "\n提前时间不大于刷新间隔，可能错过使用窗口。"
+    }
+    resizeToFitContents()
+  }
+
+  /// Applies an automatic-use setting and exposes persistence/authentication errors inline.
+  /// Setting actions save preferences only; none directly submit a card-use request.
+  private func applyCreditAutoUseChange(_ change: () throws -> Void) {
+    do {
+      try change()
+      errorLabel.stringValue = ""
+      errorLabel.isHidden = true
+    } catch {
+      errorLabel.stringValue = error.localizedDescription
+      errorLabel.isHidden = false
+    }
+    renderCreditAutoUse()
+  }
+
+  /// Commits the minute lead and synchronizes only its own field and stepper.
+  private func commitCreditAutoUseMinutes() {
+    applyCreditAutoUseChange {
+      try store.setCreditAutoUseLeadMinutes(creditAutoUseField.integerValue)
+    }
+    creditAutoUseField.integerValue = store.creditAutoUseLeadMinutes
+    creditAutoUseStepper.integerValue = store.creditAutoUseLeadMinutes
+  }
+
+  /// Binds enable to the current Codex login; disabling invalidates not-yet-submitted operations.
+  @objc private func creditAutoUseSwitchChanged() {
+    applyCreditAutoUseChange {
+      try store.setCreditAutoUseEnabled(creditAutoUseSwitch.state == .on)
+    }
+  }
+
+  /// Saves the integer minute setting when the user presses Return.
+  @objc private func creditAutoUseMinutesCommitted() {
+    commitCreditAutoUseMinutes()
+  }
+
+  /// Applies a one-minute stepper change without altering the notification reminder hours.
+  @objc private func creditAutoUseStepperChanged() {
+    creditAutoUseField.integerValue = creditAutoUseStepper.integerValue
+    commitCreditAutoUseMinutes()
+  }
+
+  /// Opens the dedicated log, or its containing directory before the first log file exists.
+  @objc private func creditAutoUseLogClicked() {
+    let directory = FileManager.default.homeDirectoryForCurrentUser
+      .appendingPathComponent("Library/Logs/CodexQuota", isDirectory: true)
+    let log = directory.appendingPathComponent("reset-credit-auto-use.log")
+    NSWorkspace.shared.open(FileManager.default.fileExists(atPath: log.path) ? log : directory)
   }
 
   /// Fits the window to visible controls while preserving its top edge as asynchronous status changes.

@@ -12,6 +12,30 @@ struct CodexAuth {
   let authPath: String
 }
 
+/// Transient identity used only by opt-in credit consumption, without retaining an ID token.
+struct CodexAutoUseIdentity {
+  /// SHA-256 of the user subject and workspace; moving auth files must not reset card deduplication.
+  let key: String
+
+  /// Canonical login-file location bound to the opt-in separately from stable account/card history.
+  let authPath: String
+
+  /// Local login email checked against App Server's account before any consumption request.
+  let email: String
+}
+
+/// Authoritative consume outcomes; unknown values must keep the original operation unresolved.
+enum ResetCreditConsumeOutcome: String {
+  /// The requested card reset the account's rate limits.
+  case reset
+  /// The backend confirms this card was redeemed already, including an idempotent replay.
+  case alreadyRedeemed
+  /// No eligible limits needed resetting; this attempt did not consume the card.
+  case nothingToReset
+  /// The requested card is unavailable and must not be selected again.
+  case noCredit
+}
+
 /// Identifies one of the two rolling Codex subscription windows.
 enum QuotaKind {
   /// Five-hour rolling usage window.
@@ -148,6 +172,9 @@ enum CodexQuotaError: LocalizedError {
   /// A transport returned a concise, already-sanitized diagnostic.
   case transport(String)
 
+  /// Exact JSON-RPC error code and message, retained for unsupported-method diagnosis.
+  case rpc(code: Int, message: String)
+
   /// Chinese error description shown directly in the compact popover.
   var errorDescription: String? {
     switch self {
@@ -163,6 +190,8 @@ enum CodexQuotaError: LocalizedError {
       return "未找到 Codex"
     case .transport(let message):
       return message
+    case .rpc(let code, let message):
+      return "RPC \(code)：\(message)"
     }
   }
 }
