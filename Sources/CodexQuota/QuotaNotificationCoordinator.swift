@@ -10,7 +10,7 @@ enum QuotaNotificationAuthorizationState: Equatable {
   /// The user has not yet responded to a notification permission request.
   case notDetermined
 
-  /// macOS currently permits this app to deliver quota reset notifications.
+  /// macOS currently permits this app to deliver quota reset and credit expiry notifications.
   case authorized
 
   /// macOS has explicitly disabled notifications for this app.
@@ -40,6 +40,9 @@ final class QuotaNotificationCoordinator: NSObject, UNUserNotificationCenterDele
   /// Keeps permission checks and notification submission serial while their callbacks are pending.
   /// Reset baselines remain unchanged during this interval so a failed attempt can be retried.
   private var deliveryInFlight = false
+
+  /// Coalesces simultaneous permission requests from reset and expiry settings into one system prompt.
+  private var authorizationCompletions: [(Bool) -> Void] = []
 
   /// Main-thread callback used when System Settings changes notification authorization.
   var onAuthorizationStatusChange: (() -> Void)?
@@ -90,23 +93,40 @@ final class QuotaNotificationCoordinator: NSObject, UNUserNotificationCenterDele
       return
     }
 
+    ensureAuthorization { [weak self] granted in
+      self?.finishEnableRequest(granted: granted, completion: completion)
+    }
+  }
+
+  /// Requests the shared macOS permission when needed without changing any feature preference.
+  /// Called on the main thread for default-enabled expiry alerts or an explicit settings enable.
+  /// Denied permission is reported without repeatedly prompting or clearing the expiry preference.
+  func ensureAuthorization(completion: @escaping (Bool) -> Void) {
+    authorizationCompletions.append(completion)
+    guard authorizationCompletions.count == 1 else { return }
     notificationCenter.getNotificationSettings { [weak self] settings in
-      guard let self else {
-        return
-      }
+      guard let self else { return }
       switch settings.authorizationStatus {
-      case .authorized, .provisional:
-        self.finishEnableRequest(granted: true, completion: completion)
       case .notDetermined:
         self.notificationCenter.requestAuthorization(options: [.alert, .sound]) {
           [weak self] granted, _ in
-          self?.finishEnableRequest(granted: granted, completion: completion)
+          self?.completeAuthorizationChecks(granted: granted)
         }
-      case .denied:
-        self.finishEnableRequest(granted: false, completion: completion)
-      @unknown default:
-        self.finishEnableRequest(granted: false, completion: completion)
+      default:
+        self.completeAuthorizationChecks(
+          granted: Self.authorizationState(for: settings.authorizationStatus) == .authorized
+        )
       }
+    }
+  }
+
+  /// Publishes the latest system state and completes all joined permission checks on the main thread.
+  private func completeAuthorizationChecks(granted: Bool) {
+    refreshAuthorizationStatus { [weak self] in
+      guard let self else { return }
+      let completions = self.authorizationCompletions
+      self.authorizationCompletions.removeAll()
+      completions.forEach { $0(granted) }
     }
   }
 
@@ -306,6 +326,29 @@ final class QuotaNotificationCoordinator: NSObject, UNUserNotificationCenterDele
       content: content,
       trigger: nil
     )
+    submitNotification(
+      request,
+      isStillEligible: { [weak self] in
+        guard let self else { return false }
+        return self.isEnabled && self.loadPersistedState().activeAccountKey == accountKey
+      },
+      completion: { [weak self] accepted in
+        guard let self else { return }
+        defer { self.deliveryInFlight = false }
+        guard accepted else { return }
+        self.recordAcceptedNotification(for: ordered, accountKey: accountKey)
+      }
+    )
+  }
+
+  /// Shared immediate notification transport for confirmed resets and freshly observed expiring cards.
+  /// Rechecks permission and caller eligibility before submission, reports macOS queue acceptance on
+  /// the main thread, and logs the exact content and error without introducing scheduled triggers.
+  func submitNotification(
+    _ request: UNNotificationRequest,
+    isStillEligible: @escaping () -> Bool,
+    completion: @escaping (Bool) -> Void
+  ) {
     notificationCenter.getNotificationSettings { [weak self] settings in
       DispatchQueue.main.async {
         guard let self else {
@@ -315,16 +358,14 @@ final class QuotaNotificationCoordinator: NSObject, UNUserNotificationCenterDele
         self.authorizationState = authorizationState
         self.onAuthorizationStatusChange?()
 
-        guard self.isEnabled,
-          self.loadPersistedState().activeAccountKey == accountKey,
-          authorizationState == .authorized
+        guard authorizationState == .authorized, isStillEligible()
         else {
-          self.deliveryInFlight = false
           self.logDelivery(
             request: request,
             authorizationStatus: settings.authorizationStatus,
             outcome: "skipped"
           )
+          completion(false)
           return
         }
 
@@ -338,17 +379,13 @@ final class QuotaNotificationCoordinator: NSObject, UNUserNotificationCenterDele
             guard let self else {
               return
             }
-            defer { self.deliveryInFlight = false }
             self.logDelivery(
               request: request,
               authorizationStatus: settings.authorizationStatus,
               outcome: error == nil ? "accepted" : "failed",
               error: error
             )
-            guard error == nil else {
-              return
-            }
-            self.recordAcceptedNotification(for: ordered, accountKey: accountKey)
+            completion(error == nil)
           }
         }
       }

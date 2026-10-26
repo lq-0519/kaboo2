@@ -39,9 +39,6 @@ enum DisplayFormatter {
     guard let window else {
       return "—"
     }
-    guard window.usedPercent > 0 else {
-      return "已满"
-    }
 
     let remainingSeconds = window.resetsAt.timeIntervalSince(now)
     guard remainingSeconds > 0 else {
@@ -78,9 +75,6 @@ enum DisplayFormatter {
     guard let window else {
       return "—"
     }
-    guard window.usedPercent > 0 else {
-      return "已满"
-    }
     guard window.resetsAt > now else {
       return "待刷新"
     }
@@ -110,9 +104,6 @@ enum DisplayFormatter {
   ) -> String {
     guard let window else {
       return "额度数据未知"
-    }
-    guard window.usedPercent > 0 else {
-      return "额度已满"
     }
     guard window.resetsAt > now else {
       return "已到重置时间，等待刷新"

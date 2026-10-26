@@ -56,6 +56,54 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
   /// Explains pending, missing or denied system authorization independently of the saved opt-in.
   private let notificationStatusLabel = NSTextField(labelWithString: "")
 
+  /// Entire login feedback row, collapsed when neither status text nor a settings action is needed.
+  /// Hiding the grid row removes its empty height and spacing between the two general switches.
+  private var launchFeedbackRow: NSGridRow?
+
+  /// Entire reset-notification feedback row, shown only while checking or requiring system permission.
+  private var notificationFeedbackRow: NSGridRow?
+
+  /// Entire expiry-notification feedback row, collapsed after system authorization is confirmed.
+  private var creditNotificationFeedbackRow: NSGridRow?
+
+  /// Overall default-on expiry preference, retained independently of system notification permission.
+  private let creditExpirySwitch = NSSwitch()
+
+  /// Independent first reminder switch, initially enabled with a twelve-hour lead time.
+  private let firstCreditReminderSwitch = NSSwitch()
+
+  /// Independent second reminder switch, initially enabled with a one-hour lead time.
+  private let secondCreditReminderSwitch = NSSwitch()
+
+  /// Integer-only hour field for the first reminder, saved on Return or when focus leaves it.
+  private let firstCreditReminderField = NSTextField()
+
+  /// Integer-only hour field for the second reminder, independent of the first reminder's value.
+  private let secondCreditReminderField = NSTextField()
+
+  /// First reminder's bounded hour stepper, incrementing exactly one hour per click.
+  private let firstCreditReminderStepper = NSStepper()
+
+  /// Second reminder's bounded hour stepper, incrementing exactly one hour per click.
+  private let secondCreditReminderStepper = NSStepper()
+
+  /// Permission feedback for expiry alerts without changing the default-on feature preference.
+  private let creditNotificationStatusLabel = NSTextField(labelWithString: "")
+
+  /// System settings entry shown when macOS has blocked expiry notifications.
+  private let openCreditNotificationSettingsButton = NSButton(
+    title: "打开系统设置", target: nil, action: nil
+  )
+
+  /// Scrolls tall settings on smaller screens while keeping every native control reachable.
+  private let settingsScrollView = NSScrollView()
+
+  /// Auto-sized document containing all settings sections and their asynchronous status rows.
+  private let settingsContentView = SettingsContentView()
+
+  /// Complete content stack used to measure the preferred height without expanding beyond the screen.
+  private var settingsStack: NSStackView?
+
   /// Explicit automatic-greeting opt-in, independent of system notification permission.
   private let greetingSwitch = NSSwitch()
 
@@ -87,6 +135,12 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
 
   /// Three-option selector for the menu-bar percentage font size.
   private let fontSizePopup = NSPopUpButton()
+
+  /// Independently selects percentage or pie for the five-hour quota's primary menu-bar row.
+  private let fiveHourStylePopup = NSPopUpButton()
+
+  /// Independently selects percentage or pie for the seven-day quota's primary menu-bar row.
+  private let sevenDayStylePopup = NSPopUpButton()
 
   /// Switch controlling quota-driven colors for menu-bar text and the pie chart.
   private let menuBarColorSwitch = NSSwitch()
@@ -120,7 +174,7 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     fatalError("init(coder:) is not supported")
   }
 
-  /// Builds three restrained settings sections with native controls and immediate persistence.
+  /// Builds native settings sections with immediate persistence and scrolling on smaller screens.
   override func loadView() {
     view = NSView(frame: NSRect(x: 0, y: 0, width: 460, height: 730))
 
@@ -139,6 +193,39 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
 
     notificationSwitch.target = self
     notificationSwitch.action = #selector(notificationSwitchChanged)
+
+    creditExpirySwitch.target = self
+    creditExpirySwitch.action = #selector(creditExpirySwitchChanged)
+    for (toggle, field, stepper, label) in [
+      (firstCreditReminderSwitch, firstCreditReminderField, firstCreditReminderStepper, "第一次提醒"),
+      (secondCreditReminderSwitch, secondCreditReminderField, secondCreditReminderStepper, "第二次提醒"),
+    ] {
+      toggle.target = self
+      toggle.action = #selector(creditReminderSwitchChanged(_:))
+      toggle.setAccessibilityLabel(label)
+      configureNumberField(
+        field,
+        minimum: 1,
+        maximum: ResetCreditNotificationCoordinator.maximumReminderHours,
+        action: #selector(creditReminderHoursCommitted(_:))
+      )
+      field.setAccessibilityLabel("\(label)提前小时数")
+      configureStepper(
+        stepper,
+        minimum: 1,
+        maximum: Double(ResetCreditNotificationCoordinator.maximumReminderHours),
+        increment: 1,
+        action: #selector(creditReminderStepperChanged(_:))
+      )
+      stepper.setAccessibilityLabel("\(label)提前小时数")
+    }
+    creditNotificationStatusLabel.font = .systemFont(ofSize: 11)
+    creditNotificationStatusLabel.textColor = .secondaryLabelColor
+    openCreditNotificationSettingsButton.target = self
+    openCreditNotificationSettingsButton.action = #selector(openNotificationSettingsClicked)
+    openCreditNotificationSettingsButton.bezelStyle = .rounded
+    openCreditNotificationSettingsButton.controlSize = .small
+    openCreditNotificationSettingsButton.isHidden = true
 
     greetingSwitch.target = self
     greetingSwitch.action = #selector(greetingSwitchChanged)
@@ -176,6 +263,9 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     }
     fontSizePopup.target = self
     fontSizePopup.action = #selector(fontSizeChanged)
+
+    configureQuotaStylePopup(fiveHourStylePopup, label: "5 小时额度样式")
+    configureQuotaStylePopup(sevenDayStylePopup, label: "7 天额度样式")
 
     menuBarColorSwitch.target = self
     menuBarColorSwitch.action = #selector(menuBarColorSwitchChanged)
@@ -237,9 +327,32 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
         ],
       ]
     )
+    launchFeedbackRow = generalGrid.row(at: 1)
+    notificationFeedbackRow = generalGrid.row(at: 3)
     let greetingGrid = settingsGrid(rows: [
       [settingLabel("重置后发送“你好”"), trailingControls([greetingSwitch])]
     ])
+    let creditReminderGrid = settingsGrid(rows: [
+      [settingLabel("到期通知"), trailingControls([creditExpirySwitch])],
+      [
+        settingLabel("第一次提醒"),
+        creditReminderControls(
+          toggle: firstCreditReminderSwitch,
+          field: firstCreditReminderField,
+          stepper: firstCreditReminderStepper
+        ),
+      ],
+      [
+        settingLabel("第二次提醒"),
+        creditReminderControls(
+          toggle: secondCreditReminderSwitch,
+          field: secondCreditReminderField,
+          stepper: secondCreditReminderStepper
+        ),
+      ],
+      [creditNotificationStatusLabel, trailingControls([openCreditNotificationSettingsButton])],
+    ])
+    creditNotificationFeedbackRow = creditReminderGrid.row(at: 3)
     let greetingSection = NSStackView(views: [
       greetingGrid,
       greetingHintLabel,
@@ -254,7 +367,9 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
 
     let appearanceGrid = settingsGrid(
       rows: [
-        [settingLabel("菜单栏字号"), trailingControls([fontSizePopup])],
+        [settingLabel("5 小时额度样式"), trailingControls([fiveHourStylePopup])],
+        [settingLabel("7 天额度样式"), trailingControls([sevenDayStylePopup])],
+        [settingLabel("百分比字号"), trailingControls([fontSizePopup])],
         [settingLabel("菜单栏时间"), trailingControls([menuBarTimePopup])],
         [
           settingLabel("菜单栏额度颜色"),
@@ -288,6 +403,9 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
         sectionTitle("通用"),
         generalGrid,
         divider(),
+        sectionTitle("重置卡到期提醒"),
+        creditReminderGrid,
+        divider(),
         sectionTitle("自动问候"),
         greetingSection,
         divider(),
@@ -304,14 +422,28 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     stack.spacing = 14
     stack.setContentHuggingPriority(.required, for: .vertical)
     stack.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(stack)
+    settingsStack = stack
+    settingsScrollView.translatesAutoresizingMaskIntoConstraints = false
+    settingsScrollView.hasVerticalScroller = true
+    settingsScrollView.autohidesScrollers = true
+    settingsScrollView.drawsBackground = false
+    settingsContentView.translatesAutoresizingMaskIntoConstraints = false
+    settingsScrollView.documentView = settingsContentView
+    settingsContentView.addSubview(stack)
+    view.addSubview(settingsScrollView)
 
     NSLayoutConstraint.activate([
-      stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 22),
-      stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
-      stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
-      stack.bottomAnchor.constraint(lessThanOrEqualTo: view.bottomAnchor, constant: -22),
+      settingsScrollView.topAnchor.constraint(equalTo: view.topAnchor),
+      settingsScrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      settingsScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      settingsScrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      settingsContentView.widthAnchor.constraint(equalTo: settingsScrollView.contentView.widthAnchor),
+      stack.topAnchor.constraint(equalTo: settingsContentView.topAnchor, constant: 22),
+      stack.leadingAnchor.constraint(equalTo: settingsContentView.leadingAnchor, constant: 24),
+      stack.trailingAnchor.constraint(equalTo: settingsContentView.trailingAnchor, constant: -24),
+      stack.bottomAnchor.constraint(equalTo: settingsContentView.bottomAnchor, constant: -22),
       generalGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      creditReminderGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
       greetingSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
       greetingGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
       greetingHintLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -321,13 +453,21 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       errorLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
       quotaIntervalField.widthAnchor.constraint(equalToConstant: 76),
       creditsIntervalField.widthAnchor.constraint(equalToConstant: 76),
+      firstCreditReminderField.widthAnchor.constraint(equalToConstant: 54),
+      secondCreditReminderField.widthAnchor.constraint(equalToConstant: 54),
       fontSizePopup.widthAnchor.constraint(equalToConstant: 126),
+      fiveHourStylePopup.widthAnchor.constraint(equalToConstant: 126),
+      sevenDayStylePopup.widthAnchor.constraint(equalToConstant: 126),
       menuBarTimePopup.widthAnchor.constraint(equalToConstant: 150),
     ])
 
     store.onGreetingChange = { [weak self] in
       guard let self, self.isViewLoaded else { return }
       self.renderGreeting()
+    }
+    store.onNotificationChange = { [weak self] in
+      guard let self, self.isViewLoaded else { return }
+      self.renderNotifications()
     }
     render()
   }
@@ -350,6 +490,8 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       commitQuotaInterval()
     } else if field === creditsIntervalField {
       commitCreditsInterval()
+    } else if field === firstCreditReminderField || field === secondCreditReminderField {
+      commitCreditReminderHours(field)
     }
   }
 
@@ -360,7 +502,26 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     quotaIntervalStepper.integerValue = store.refreshIntervalSeconds
     creditsIntervalField.integerValue = store.creditsRefreshIntervalMinutes
     creditsIntervalStepper.integerValue = store.creditsRefreshIntervalMinutes
+    for (slot, field, stepper) in [
+      (ResetCreditReminderSlot.first, firstCreditReminderField, firstCreditReminderStepper),
+      (ResetCreditReminderSlot.second, secondCreditReminderField, secondCreditReminderStepper),
+    ] {
+      let settings = store.creditExpiryReminderSettings(for: slot)
+      field.integerValue = settings.hours
+      stepper.integerValue = settings.hours
+    }
     menuBarColorSwitch.state = store.menuBarDynamicColorsEnabled ? .on : .off
+
+    for (popup, kind) in [
+      (fiveHourStylePopup, QuotaKind.fiveHour),
+      (sevenDayStylePopup, QuotaKind.sevenDay),
+    ] {
+      if let item = popup.itemArray.first(where: {
+        ($0.representedObject as? String) == store.menuBarQuotaStyle(for: kind).rawValue
+      }) {
+        popup.select(item)
+      }
+    }
 
     if let item = fontSizePopup.itemArray.first(where: {
       ($0.representedObject as? Int) == store.menuBarFontSize
@@ -392,7 +553,16 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       launchSwitch.isEnabled = false
       launchStatusLabel.stringValue = "当前不可用"
     }
+    launchFeedbackRow?.isHidden =
+      launchStatusLabel.stringValue.isEmpty && openSystemSettingsButton.isHidden
 
+    renderNotifications()
+    resizeToFitContents()
+  }
+
+  /// Updates notification switches and permission feedback without overwriting edited hour fields.
+  /// Expiry opt-in stays enabled when permission is denied so granting permission resumes reminders.
+  private func renderNotifications() {
     notificationSwitch.isEnabled = true
     notificationSwitch.state = store.resetNotificationsEnabled ? .on : .off
     notificationStatusLabel.stringValue = ""
@@ -411,6 +581,36 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       openNotificationSettingsButton.isHidden = false
     case .authorized:
       break
+    }
+    notificationFeedbackRow?.isHidden =
+      notificationStatusLabel.stringValue.isEmpty && openNotificationSettingsButton.isHidden
+    creditExpirySwitch.state = store.creditExpiryNotificationsEnabled ? .on : .off
+    creditNotificationStatusLabel.stringValue = ""
+    openCreditNotificationSettingsButton.isHidden = true
+    switch store.resetNotificationAuthorizationState {
+    case .unknown:
+      creditNotificationStatusLabel.stringValue = "正在检查系统通知权限"
+    case .notDetermined:
+      creditNotificationStatusLabel.stringValue = "尚未授权系统通知"
+    case .denied:
+      creditNotificationStatusLabel.stringValue = "系统通知已关闭"
+      openCreditNotificationSettingsButton.isHidden = false
+    case .authorized:
+      break
+    }
+    creditNotificationFeedbackRow?.isHidden =
+      creditNotificationStatusLabel.stringValue.isEmpty && openCreditNotificationSettingsButton.isHidden
+    for (slot, toggle, field, stepper) in [
+      (ResetCreditReminderSlot.first, firstCreditReminderSwitch, firstCreditReminderField,
+        firstCreditReminderStepper),
+      (ResetCreditReminderSlot.second, secondCreditReminderSwitch, secondCreditReminderField,
+        secondCreditReminderStepper),
+    ] {
+      let settings = store.creditExpiryReminderSettings(for: slot)
+      toggle.state = settings.isEnabled ? .on : .off
+      toggle.isEnabled = store.creditExpiryNotificationsEnabled
+      field.isEnabled = store.creditExpiryNotificationsEnabled && settings.isEnabled
+      stepper.isEnabled = field.isEnabled
     }
     resizeToFitContents()
   }
@@ -432,7 +632,11 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
   func resizeToFitContents() {
     guard isViewLoaded, let window = view.window else { return }
     view.layoutSubtreeIfNeeded()
-    let contentSize = NSSize(width: 460, height: ceil(view.fittingSize.height))
+    let preferredHeight = ceil((settingsStack?.fittingSize.height ?? 686) + 44)
+    let availableHeight = max(
+      320, (window.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
+    ) - 80
+    let contentSize = NSSize(width: 460, height: min(preferredHeight, availableHeight))
     let fittedFrame = window.frameRect(forContentRect: NSRect(origin: .zero, size: contentSize))
     var frame = window.frame
     guard abs(frame.height - fittedFrame.height) > 0.5 else { return }
@@ -477,6 +681,18 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
   /// Resumes future detection after the user has inspected a possibly submitted greeting.
   @objc private func reviewGreetingClicked() {
     applyGreetingChange { try store.acknowledgeResetGreetingReview() }
+  }
+
+  /// Populates one independent style selector with stable raw values and an accessible window label.
+  /// Both selectors share the same action; sender identity determines which quota preference is saved.
+  private func configureQuotaStylePopup(_ popup: NSPopUpButton, label: String) {
+    for style in MenuBarQuotaDisplayStyle.allCases {
+      popup.addItem(withTitle: style.displayName)
+      popup.lastItem?.representedObject = style.rawValue
+    }
+    popup.target = self
+    popup.action = #selector(quotaStyleChanged(_:))
+    popup.setAccessibilityLabel(label)
   }
 
   /// Configures an integer-only text field with bounds and Return-key action.
@@ -554,6 +770,17 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     return trailingControls([field, stepper, unitLabel])
   }
 
+  /// Groups one independent reminder switch with an integer-hour field and one-hour stepper.
+  private func creditReminderControls(
+    toggle: NSSwitch,
+    field: NSTextField,
+    stepper: NSStepper
+  ) -> NSStackView {
+    let prefix = settingLabel("提前")
+    let unit = settingLabel("小时")
+    return trailingControls([toggle, prefix, field, stepper, unit])
+  }
+
   /// Creates a two-column settings grid with stable row and column spacing.
   private func settingsGrid(rows: [[NSView]]) -> NSGridView {
     let grid = NSGridView(views: rows)
@@ -584,6 +811,43 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
   private func commitCreditsInterval() {
     store.setCreditsRefreshInterval(minutes: creditsIntervalField.integerValue)
     render()
+  }
+
+  /// Commits only the edited reminder value, preserving the other field's focus and saved history.
+  private func commitCreditReminderHours(_ field: NSTextField) {
+    let slot: ResetCreditReminderSlot = field === firstCreditReminderField ? .first : .second
+    store.setCreditExpiryReminderHours(field.integerValue, for: slot)
+    let hours = store.creditExpiryReminderSettings(for: slot).hours
+    field.integerValue = hours
+    let stepper = slot == .first ? firstCreditReminderStepper : secondCreditReminderStepper
+    stepper.integerValue = hours
+  }
+
+  /// Saves the master preference while keeping system authorization feedback separate from opt-in.
+  @objc private func creditExpirySwitchChanged() {
+    let enabled = creditExpirySwitch.state == .on
+    store.setCreditExpiryNotificationsEnabled(enabled) { [weak self] _ in
+      self?.renderNotifications()
+    }
+  }
+
+  /// Saves an independent reminder switch without sending or forgetting a prior accepted alert.
+  @objc private func creditReminderSwitchChanged(_ sender: NSSwitch) {
+    let slot: ResetCreditReminderSlot = sender === firstCreditReminderSwitch ? .first : .second
+    store.setCreditExpiryReminderEnabled(sender.state == .on, for: slot)
+  }
+
+  /// Handles Return in either integer-only expiry reminder hour field.
+  @objc private func creditReminderHoursCommitted(_ sender: NSTextField) {
+    commitCreditReminderHours(sender)
+  }
+
+  /// Applies an exact one-hour stepper change to the associated persisted reminder preference.
+  @objc private func creditReminderStepperChanged(_ sender: NSStepper) {
+    let field = sender === firstCreditReminderStepper
+      ? firstCreditReminderField : secondCreditReminderField
+    field.integerValue = sender.integerValue
+    commitCreditReminderHours(field)
   }
 
   /// Applies the native login-item switch and surfaces any registration failure.
@@ -638,6 +902,24 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     store.setMenuBarFontSize(size)
   }
 
+  /// Persists the sending selector's style immediately while preserving the other quota's choice.
+  @objc private func quotaStyleChanged(_ sender: NSPopUpButton) {
+    guard let value = sender.selectedItem?.representedObject as? String,
+      let style = MenuBarQuotaDisplayStyle(rawValue: value)
+    else {
+      return
+    }
+    let kind: QuotaKind
+    if sender === fiveHourStylePopup {
+      kind = .fiveHour
+    } else if sender === sevenDayStylePopup {
+      kind = .sevenDay
+    } else {
+      return
+    }
+    store.setMenuBarQuotaStyle(style, for: kind)
+  }
+
   /// Applies the menu-bar quota color preference immediately without restarting the app.
   @objc private func menuBarColorSwitchChanged() {
     store.setMenuBarDynamicColorsEnabled(menuBarColorSwitch.state == .on)
@@ -674,4 +956,10 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     creditsIntervalField.integerValue = creditsIntervalStepper.integerValue
     commitCreditsInterval()
   }
+}
+
+/// Top-origin settings document that naturally opens at the first section inside a scroll view.
+private final class SettingsContentView: NSView {
+  /// Uses a top-left origin so initial scrolling and expanding status rows preserve reading order.
+  override var isFlipped: Bool { true }
 }

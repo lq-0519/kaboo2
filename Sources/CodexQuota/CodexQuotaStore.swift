@@ -17,6 +17,12 @@ final class CodexQuotaStore {
   /// Persisted selection shared by both menu-bar time rows; absent or unknown values use countdown.
   private static let menuBarTimeDisplayModeKey = "menuBarTimeDisplayMode"
 
+  /// Independent style preference for the five-hour quota; missing values preserve the percentage default.
+  private static let fiveHourMenuBarStyleKey = "fiveHourMenuBarDisplayStyle"
+
+  /// Independent style preference for the seven-day quota; missing values preserve the pie default.
+  private static let sevenDayMenuBarStyleKey = "sevenDayMenuBarDisplayStyle"
+
   /// Minimum interval that protects the account endpoint from accidental request storms.
   private static let minimumRefreshInterval = 10
 
@@ -46,6 +52,11 @@ final class CodexQuotaStore {
 
   /// Account-scoped detector and macOS delivery coordinator for confirmed quota resets.
   private let notificationCoordinator = QuotaNotificationCoordinator()
+
+  /// Refresh-only expiry reminders sharing the existing notification permissions and transport.
+  private lazy var creditNotificationCoordinator = ResetCreditNotificationCoordinator(
+    notifications: notificationCoordinator
+  )
 
   /// Independent opt-in, cycle ledger and CLI sender for automatic reset greetings.
   private let greetingCoordinator = QuotaGreetingCoordinator()
@@ -145,6 +156,14 @@ final class CodexQuotaStore {
     return stored.flatMap(MenuBarTimeDisplayMode.init(rawValue:)) ?? .countdown
   }
 
+  /// Reads one quota's saved primary-row style without changing the other window's preference.
+  /// Absent or unrecognized values preserve the original five-hour percentage and seven-day pie layout.
+  func menuBarQuotaStyle(for kind: QuotaKind) -> MenuBarQuotaDisplayStyle {
+    let stored = UserDefaults.standard.string(forKey: Self.menuBarQuotaStyleKey(for: kind))
+    let defaultStyle: MenuBarQuotaDisplayStyle = kind == .fiveHour ? .percentage : .pie
+    return stored.flatMap(MenuBarQuotaDisplayStyle.init(rawValue:)) ?? defaultStyle
+  }
+
   /// Indicates whether quota reset alerts were explicitly enabled inside the app.
   var resetNotificationsEnabled: Bool {
     notificationCoordinator.isEnabled
@@ -155,10 +174,22 @@ final class CodexQuotaStore {
     notificationCoordinator.authorizationState
   }
 
+  /// Default-enabled expiry preference, independent of the quota-reset notification switch.
+  var creditExpiryNotificationsEnabled: Bool { creditNotificationCoordinator.isEnabled }
+
+  /// Settings-only callback that refreshes permission feedback without replacing edited hour fields.
+  var onNotificationChange: (() -> Void)?
+
+  /// Returns one reminder's persisted independent switch and positive whole-hour threshold.
+  func creditExpiryReminderSettings(for slot: ResetCreditReminderSlot) -> ResetCreditReminderSettings {
+    creditNotificationCoordinator.settings(for: slot)
+  }
+
   /// Creates the store and forwards asynchronous permission changes to shared UI rendering.
   init() {
     notificationCoordinator.onAuthorizationStatusChange = { [weak self] in
       self?.onChange?()
+      self?.onNotificationChange?()
     }
     greetingCoordinator.onChange = { [weak self] in
       self?.onChange?()
@@ -174,6 +205,9 @@ final class CodexQuotaStore {
     }
     hasStarted = true
     notificationCoordinator.start()
+    if creditNotificationCoordinator.isEnabled {
+      notificationCoordinator.ensureAuthorization { _ in }
+    }
     scheduleUsageTimer()
     scheduleCreditsTimer()
     refreshAll()
@@ -232,6 +266,13 @@ final class CodexQuotaStore {
     onChange?()
   }
 
+  /// Saves only the selected quota's primary-row style and immediately requests a local redraw.
+  /// This display preference neither fetches quota data nor changes the refresh or reset-time schedules.
+  func setMenuBarQuotaStyle(_ style: MenuBarQuotaDisplayStyle, for kind: QuotaKind) {
+    UserDefaults.standard.set(style.rawValue, forKey: Self.menuBarQuotaStyleKey(for: kind))
+    onChange?()
+  }
+
   /// Applies an explicit reset-notification preference and returns the effective result.
   func setResetNotificationsEnabled(
     _ enabled: Bool,
@@ -253,6 +294,32 @@ final class CodexQuotaStore {
   /// Opens the app-specific macOS notification settings pane for denied permission.
   func openResetNotificationSystemSettings() {
     notificationCoordinator.openSystemSettings()
+  }
+
+  /// Saves the overall expiry preference and requests shared system permission when enabling it.
+  /// Preference changes never check cached cards or fetch data; reminders wait for the next refresh.
+  func setCreditExpiryNotificationsEnabled(
+    _ enabled: Bool,
+    completion: @escaping (Bool) -> Void
+  ) {
+    creditNotificationCoordinator.setEnabled(enabled)
+    onNotificationChange?()
+    guard enabled else {
+      completion(false)
+      return
+    }
+    notificationCoordinator.ensureAuthorization(completion: completion)
+  }
+
+  /// Saves one expiry reminder switch without clearing its per-card notification history.
+  func setCreditExpiryReminderEnabled(_ enabled: Bool, for slot: ResetCreditReminderSlot) {
+    creditNotificationCoordinator.setReminderEnabled(enabled, for: slot)
+    onNotificationChange?()
+  }
+
+  /// Saves an integer-hour lead time applied only by the next successful reset-credit refresh.
+  func setCreditExpiryReminderHours(_ hours: Int, for slot: ResetCreditReminderSlot) {
+    creditNotificationCoordinator.setReminderHours(hours, for: slot)
   }
 
   /// Persists the greeting switch and seeds a fresh account-bound baseline after enabling it.
@@ -350,6 +417,14 @@ final class CodexQuotaStore {
         self.creditsRefreshInFlight = false
         switch result {
         case .success(let snapshot):
+          self.creditNotificationCoordinator.observe(
+            snapshot: snapshot,
+            accountID: auth.accountID,
+            isCurrentAccount: { [weak self] in
+              guard let self, let currentAuth = try? self.authStore.load() else { return false }
+              return currentAuth.accountID == auth.accountID && currentAuth.authPath == auth.authPath
+            }
+          )
           self.creditsSnapshot = snapshot
           self.creditsError = nil
         case .failure(let error):
@@ -407,6 +482,16 @@ final class CodexQuotaStore {
       maximumCreditsRefreshInterval,
       max(minimumCreditsRefreshInterval, value)
     )
+  }
+
+  /// Maps a quota window to its stable, independent preference key for both reads and writes.
+  private static func menuBarQuotaStyleKey(for kind: QuotaKind) -> String {
+    switch kind {
+    case .fiveHour:
+      return fiveHourMenuBarStyleKey
+    case .sevenDay:
+      return sevenDayMenuBarStyleKey
+    }
   }
 
   /// Clamps menu-bar typography to the three sizes supported by the layout.

@@ -4,13 +4,15 @@ import CoreText
 /// Builds the complete two-row menu-bar presentation as one image so AppKit can apply
 /// native status-item highlighting and inactive-state treatment to the whole surface.
 enum MenuBarQuotaImage {
-  /// Produces two centered columns: five-hour percentage/time and seven-day pie/time.
-  /// The primary row follows the configured percentage size, while both compact time rows use
+  /// Produces two centered columns with independently selected percentage or pie primary rows.
+  /// Percentages follow the configured font size, while pies keep a thirteen-point canvas and time rows use
   /// the battery monitor's nine-point secondary hierarchy inside a stable 22-point canvas.
   /// Time labels come from the caller's shared presentation so image, cache and tooltip agree.
   static func make(
     fiveHourWindow: QuotaWindow?,
     sevenDayWindow: QuotaWindow?,
+    fiveHourStyle: MenuBarQuotaDisplayStyle,
+    sevenDayStyle: MenuBarQuotaDisplayStyle,
     fiveHourTime: String,
     sevenDayTime: String,
     primaryFontSize: Int,
@@ -39,6 +41,12 @@ enum MenuBarQuotaImage {
       color: fiveHourColor ?? neutralColor
     )
     let fiveHourTitleBounds = glyphBounds(of: fiveHourTitle)
+    let sevenDayTitle = textLine(
+      DisplayFormatter.percent(sevenDayWindow?.remainingPercent),
+      font: primaryFont,
+      color: sevenDayColor ?? neutralColor
+    )
+    let sevenDayTitleBounds = glyphBounds(of: sevenDayTitle)
     let fiveHourTimeLine = textLine(
       fiveHourTime,
       font: secondaryFont,
@@ -57,26 +65,32 @@ enum MenuBarQuotaImage {
     // Reserve all normal formats across both modes so minute changes and midnight transitions
     // cannot shift the adjacent status items. Glyph ink, rather than character count, sets the width.
     let fiveHourTimeWidth = maximumTextWidth(
-      ["5h59", "23:59", "已满", "待刷新", "—"],
+      ["5h59", "23:59", "待刷新", "—"],
       font: secondaryFont
     )
     let sevenDayTimeWidth = maximumTextWidth(
-      ["7d23", "23h59", "23:59", "12/31", "已满", "待刷新", "—"],
+      ["7d23", "23h59", "23:59", "12/31", "待刷新", "—"],
       font: secondaryFont
     )
 
     let pieCanvasSize: CGFloat = 13
     let groupSpacing: CGFloat = 4
+    let fiveHourPrimaryWidth =
+      fiveHourStyle == .percentage
+      ? max(widestPercentageBounds.width, fiveHourTitleBounds.width) : pieCanvasSize
+    let sevenDayPrimaryWidth =
+      sevenDayStyle == .percentage
+      ? max(widestPercentageBounds.width, sevenDayTitleBounds.width) : pieCanvasSize
     let fiveHourWidth = ceil(
       max(
-        widestPercentageBounds.width,
-        max(fiveHourTimeWidth, max(fiveHourTitleBounds.width, fiveHourTimeBounds.width))
+        fiveHourPrimaryWidth,
+        max(fiveHourTimeWidth, fiveHourTimeBounds.width)
       )
     )
     let sevenDayWidth = ceil(
       max(
-        sevenDayTimeWidth,
-        max(pieCanvasSize, sevenDayTimeBounds.width)
+        sevenDayPrimaryWidth,
+        max(sevenDayTimeWidth, sevenDayTimeBounds.width)
       )
     )
     let imageSize = NSSize(
@@ -93,15 +107,30 @@ enum MenuBarQuotaImage {
       defer { context.restoreGState() }
       context.textMatrix = .identity
 
-      draw(
-        fiveHourTitle,
-        bounds: fiveHourTitleBounds,
-        origin: 0,
-        width: fiveHourWidth,
-        regionMinY: 9,
-        regionHeight: 13,
-        in: context
-      )
+      switch fiveHourStyle {
+      case .percentage:
+        draw(
+          fiveHourTitle,
+          bounds: fiveHourTitleBounds,
+          origin: 0,
+          width: fiveHourWidth,
+          regionMinY: 9,
+          regionHeight: 13,
+          in: context
+        )
+      case .pie:
+        drawPie(
+          remainingPercent: fiveHourWindow?.remainingPercent,
+          color: fiveHourColor ?? neutralColor,
+          rect: CGRect(
+            x: (fiveHourWidth - pieCanvasSize) / 2,
+            y: 9,
+            width: pieCanvasSize,
+            height: pieCanvasSize
+          ),
+          in: context
+        )
+      }
       draw(
         fiveHourTimeLine,
         bounds: fiveHourTimeBounds,
@@ -111,17 +140,30 @@ enum MenuBarQuotaImage {
         regionHeight: 9,
         in: context
       )
-      drawPie(
-        remainingPercent: sevenDayWindow?.remainingPercent,
-        color: sevenDayColor ?? neutralColor,
-        rect: CGRect(
-          x: sevenDayOrigin + (sevenDayWidth - pieCanvasSize) / 2,
-          y: 9,
-          width: pieCanvasSize,
-          height: pieCanvasSize
-        ),
-        in: context
-      )
+      switch sevenDayStyle {
+      case .percentage:
+        draw(
+          sevenDayTitle,
+          bounds: sevenDayTitleBounds,
+          origin: sevenDayOrigin,
+          width: sevenDayWidth,
+          regionMinY: 9,
+          regionHeight: 13,
+          in: context
+        )
+      case .pie:
+        drawPie(
+          remainingPercent: sevenDayWindow?.remainingPercent,
+          color: sevenDayColor ?? neutralColor,
+          rect: CGRect(
+            x: sevenDayOrigin + (sevenDayWidth - pieCanvasSize) / 2,
+            y: 9,
+            width: pieCanvasSize,
+            height: pieCanvasSize
+          ),
+          in: context
+        )
+      }
       draw(
         sevenDayTimeLine,
         bounds: sevenDayTimeBounds,
@@ -177,7 +219,7 @@ enum MenuBarQuotaImage {
     CTLineDraw(line, context)
   }
 
-  /// Draws the seven-day remaining fraction clockwise from twelve o'clock inside the primary row.
+  /// Draws either quota's remaining fraction clockwise from twelve o'clock inside its primary row.
   private static func drawPie(
     remainingPercent: Double?,
     color: NSColor,

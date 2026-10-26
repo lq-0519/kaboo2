@@ -31,6 +31,26 @@ enum QuotaKind {
   }
 }
 
+/// Selects how the primary menu-bar row represents the remaining amount of one quota window.
+/// Each window persists its own raw value so the two styles can be configured independently.
+enum MenuBarQuotaDisplayStyle: String, CaseIterable {
+  /// Shows the remaining percentage as an integer using the configured percentage font size.
+  case percentage
+
+  /// Shows the remaining fraction as a filled pie inside the fixed thirteen-point primary canvas.
+  case pie
+
+  /// Chinese label used by the native quota-style selectors in settings.
+  var displayName: String {
+    switch self {
+    case .percentage:
+      return "百分比"
+    case .pie:
+      return "饼图"
+    }
+  }
+}
+
 /// Selects the meaning of the secondary menu-bar row for both quota windows.
 /// Raw values are persisted so the user's choice survives app restarts and future label changes.
 enum MenuBarTimeDisplayMode: String, CaseIterable {
@@ -82,7 +102,8 @@ struct QuotaSnapshot {
 
 /// Displayable details for one Codex rate-limit reset credit.
 struct ResetCredit {
-  /// Opaque backend identifier retained only for stable ordering and diagnostics.
+  /// Opaque backend identifier used for stable ordering and account-scoped reminder deduplication.
+  /// Sent reminder slots remain tied to this ID even when its expiry or configured lead time changes.
   let id: String
 
   /// Backend-provided title, normalized to a useful fallback when absent.

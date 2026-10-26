@@ -129,6 +129,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     let sevenDayWindow = store.quotaSnapshot?.sevenDay
     let fiveHourTitle = DisplayFormatter.percent(fiveHourWindow?.remainingPercent)
     let sevenDayTitle = DisplayFormatter.percent(sevenDayWindow?.remainingPercent)
+    let fiveHourStyle = store.menuBarQuotaStyle(for: .fiveHour)
+    let sevenDayStyle = store.menuBarQuotaStyle(for: .sevenDay)
     let timeMode = store.menuBarTimeDisplayMode
     let fiveHourTime = DisplayFormatter.menuBarResetTime(
       for: fiveHourWindow,
@@ -146,6 +148,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
       String(store.menuBarFontSize),
       String(dynamicColorsEnabled),
       timeMode.rawValue,
+      fiveHourStyle.rawValue,
+      sevenDayStyle.rawValue,
       fiveHourTitle,
       fiveHourTime,
       fiveHourWindow.map { String($0.remainingPercent) } ?? "nil",
@@ -160,6 +164,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         image = MenuBarQuotaImage.make(
           fiveHourWindow: fiveHourWindow,
           sevenDayWindow: sevenDayWindow,
+          fiveHourStyle: fiveHourStyle,
+          sevenDayStyle: sevenDayStyle,
           fiveHourTime: fiveHourTime,
           sevenDayTime: sevenDayTime,
           primaryFontSize: store.menuBarFontSize,
