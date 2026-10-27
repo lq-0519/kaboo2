@@ -74,12 +74,14 @@ final class CodexAppServerClient {
 
   /// Creates and initializes one bounded child; all callers share shutdown and diagnostic rules.
   /// Automatic operations mirror every RPC and child diagnostic to their dedicated private log.
+  /// Uses the same desktop-first CLI locator as background greetings, so login-item launches
+  /// prefer the bundled CLI over npm launchers that require Node in the terminal's PATH.
   private func withSession<T>(
     auth: CodexAuth, diagnostics: RPCFileLogger? = nil,
     cancellation: ResetCreditConsumptionCancellation? = nil,
     body: (AppServerSession) throws -> T
   ) throws -> T {
-    let executable = try locateExecutable()
+    let executable = try CodexExecutableLocator.locate(fileManager: fileManager)
     let session = try AppServerSession(
       executableURL: URL(fileURLWithPath: executable),
       arguments: arguments(for: auth),
@@ -189,31 +191,6 @@ final class CodexAppServerClient {
       .replacingOccurrences(of: "\\", with: "\\\\")
       .replacingOccurrences(of: "\"", with: "\\\"")
     return "\"\(escaped)\""
-  }
-
-  /// Locates the CLI or bundled launcher from deterministic, executable-only paths.
-  private func locateExecutable() throws -> String {
-    let home = fileManager.homeDirectoryForCurrentUser.path
-    var candidates = [
-      "\(home)/.local/bin/codex",
-      "\(home)/.npm-global/bin/codex",
-      "/opt/homebrew/bin/codex",
-      "/usr/local/bin/codex",
-      "/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
-      "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
-      "\(home)/Applications/Codex.app/Contents/Resources/codex-cli/bin/codex",
-      "\(home)/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
-    ]
-    if let path = ProcessInfo.processInfo.environment["PATH"] {
-      candidates.insert(
-        contentsOf: path.split(separator: ":").map { "\($0)/codex" },
-        at: 0
-      )
-    }
-    guard let executable = candidates.first(where: fileManager.isExecutableFile(atPath:)) else {
-      throw CodexQuotaError.codexNotFound
-    }
-    return executable
   }
 
   /// Validates and sorts the reset-credit detail rows while preserving the authoritative count.
