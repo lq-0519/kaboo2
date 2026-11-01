@@ -14,6 +14,7 @@
 - 重置卡到期通知默认开启，支持两档独立开关及整数小时提前量，默认提前 12 小时和 1 小时。
 - 自动使用重置卡默认关闭，支持整数分钟提前量，默认到期前 10 分钟，并保留持久化去重记录和完整执行日志。
 - 可选的额度恢复自动问候，通过 Codex CLI 在后台发送一次“你好”。
+- 在设置里选择 Codex 的 HTTP 流式或 WebSocket 优先连接方式。
 - 支持登录后自动启动；暂时查询失败时保留最近有效数据并显示错误。
 
 ## 适合什么场景
@@ -77,6 +78,10 @@ SIGNING_IDENTITY="你的代码签名证书名称" ./build.sh
 
 “显示”里的“5 小时额度样式”和“7 天额度样式”分别选择百分比或饼图，支持任意组合；默认仍为 5 小时百分比、7 天饼图。选择立即保存并更新菜单栏，下方时间和额度颜色继续使用已有设置。“百分比字号”只影响数字，饼图保持固定大小；同时选择两个饼图时仍会保留字号，切回百分比后继续生效。
 
+“Codex 连接 → 连接方式”支持“HTTP 流式”和“WebSocket 优先（默认）”；后者仍保留 Codex 的 HTTP 自动回退。选择后保存到当前 `CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`），请手动重启 ChatGPT / Codex 并新建会话使用。工具不会重启应用或切换正在运行的任务；已有会话可能保留原来的服务配置。该设置针对模型响应连接，不改变额度查询的 HTTPS 请求。
+
+HTTP 模式使用独立的 `codex_quota_http` provider，保留 OpenAI 登录和默认服务地址，通过 `supports_websockets = false` 选择 HTTP/SSE。切回默认时恢复内置 OpenAI，保留未启用的 HTTP 定义供历史会话引用。保存使用 Codex 自带配置接口和版本检查，保留其他字段及注释；使用自定义服务、地址、配置方案或受管理配置时显示原因并禁止覆盖。设置页可“重新读取”外部修改，配置响应中的密钥不会写入日志。此能力已在桌面内置 CLI `0.165.0-alpha.1.2` 上验证，旧版 CLI 不支持配置接口时会提示错误。
+
 ## 常见问题
 
 **提示未检测到 Codex 登录？** 先在 Codex 中使用 ChatGPT 账号完成登录，确认认证文件路径与 `CODEX_HOME` 设置一致。
@@ -104,6 +109,7 @@ SIGNING_IDENTITY="你的代码签名证书名称" ./build.sh
 - [额度查询](Sources/CodexQuota/CodexUsageService.swift)
 - [重置卡查询](Sources/CodexQuota/CodexAppServerClient.swift)
 - [刷新与设置](Sources/CodexQuota/CodexQuotaStore.swift)
+- [Codex 连接设置](Sources/CodexQuota/CodexTransportSettings.swift)
 - [恢复通知](Sources/CodexQuota/QuotaNotificationCoordinator.swift)
 - [重置卡到期提醒](Sources/CodexQuota/ResetCreditNotificationCoordinator.swift)
 - [自动使用重置卡](Sources/CodexQuota/ResetCreditAutoUseCoordinator.swift)

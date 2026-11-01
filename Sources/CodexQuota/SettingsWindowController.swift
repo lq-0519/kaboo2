@@ -34,6 +34,29 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
   /// Shared store that persists and applies application-level preferences.
   private let store: CodexQuotaStore
 
+  /// Reads and edits Codex's saved transport independently of quota or card refresh operations.
+  private let transportSettings = CodexTransportSettings()
+
+  /// Explicit HTTP or WebSocket-first choice, disabled until the saved configuration is known.
+  private let transportPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+
+  /// Reloads external edits without writing settings or restarting a running Codex conversation.
+  private let transportReloadButton = NSButton(title: "重新读取", target: nil, action: nil)
+
+  /// Explains when the saved preference will apply and the retained WebSocket fallback behavior.
+  private let transportHintLabel = NSTextField(wrappingLabelWithString:
+    "WebSocket 失败时可自动回退 HTTP。修改后请手动重启 ChatGPT / Codex，并新建会话。"
+  )
+
+  /// Saved-state feedback must not imply that an already-running connection has changed.
+  private let transportStatusLabel = NSTextField(wrappingLabelWithString: "正在读取连接设置…")
+
+  /// Latest successful read restores the selector if saving fails or another config takes priority.
+  private var transportSnapshot: CodexTransportSnapshot?
+
+  /// Serializes user-triggered reads and writes without blocking the AppKit main thread.
+  private var isUpdatingTransport = false
+
   /// Native login-item wrapper used only by the launch-at-login row.
   private let launchAtLogin = LaunchAtLoginManager()
 
@@ -198,6 +221,23 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
 
     launchSwitch.target = self
     launchSwitch.action = #selector(launchSwitchChanged)
+
+    for mode in CodexTransportMode.allCases {
+      transportPopup.addItem(withTitle: mode.displayName)
+      transportPopup.lastItem?.representedObject = mode.rawValue
+    }
+    transportPopup.target = self
+    transportPopup.action = #selector(transportChanged)
+    transportPopup.isEnabled = false
+    transportPopup.setAccessibilityLabel("Codex 连接方式")
+    transportReloadButton.target = self
+    transportReloadButton.action = #selector(reloadTransport)
+    transportReloadButton.bezelStyle = .rounded
+    transportReloadButton.controlSize = .small
+    for label in [transportHintLabel, transportStatusLabel] {
+      label.font = .systemFont(ofSize: 11)
+      label.textColor = .secondaryLabelColor
+    }
 
     launchStatusLabel.font = .systemFont(ofSize: 11)
     launchStatusLabel.textColor = .secondaryLabelColor
@@ -455,10 +495,24 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       ]
     )
 
+    let transportGrid = settingsGrid(rows: [
+      [settingLabel("连接方式"), trailingControls([transportPopup])],
+    ])
+    let transportSection = NSStackView(views: [
+      transportGrid, transportHintLabel, transportStatusLabel,
+      trailingControls([transportReloadButton]),
+    ])
+    transportSection.orientation = .vertical
+    transportSection.alignment = .leading
+    transportSection.spacing = 8
+
     let stack = NSStackView(
       views: [
         sectionTitle("通用"),
         generalGrid,
+        divider(),
+        sectionTitle("Codex 连接"),
+        transportSection,
         divider(),
         sectionTitle("重置卡到期提醒"),
         creditReminderGrid,
@@ -503,6 +557,10 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       stack.trailingAnchor.constraint(equalTo: settingsContentView.trailingAnchor, constant: -24),
       stack.bottomAnchor.constraint(equalTo: settingsContentView.bottomAnchor, constant: -22),
       generalGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      transportSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      transportGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      transportHintLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      transportStatusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
       creditReminderGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
       creditAutoUseSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
       creditAutoUseGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -539,14 +597,77 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       self.renderCreditAutoUse()
     }
     render()
+    updateTransport()
   }
 
   /// Refreshes login-item state whenever the retained window becomes visible.
   override func viewWillAppear() {
     super.viewWillAppear()
     render()
+    updateTransport()
     store.refreshResetNotificationAuthorizationStatus { [weak self] in
       self?.render()
+    }
+  }
+
+  /// Saves a user-selected transport; actual running Codex processes remain untouched.
+  @objc private func transportChanged() {
+    guard let value = transportPopup.selectedItem?.representedObject as? String,
+      let mode = CodexTransportMode(rawValue: value) else { return }
+    updateTransport(saving: mode)
+  }
+
+  /// Refreshes the saved selection after the user edits Codex configuration elsewhere.
+  @objc private func reloadTransport() {
+    updateTransport()
+  }
+
+  /// Runs config RPCs off the main thread and shows errors without falsely confirming a save.
+  private func updateTransport(saving mode: CodexTransportMode? = nil) {
+    guard !isUpdatingTransport else { return }
+    isUpdatingTransport = true
+    transportPopup.isEnabled = false
+    transportReloadButton.isEnabled = false
+    transportStatusLabel.stringValue = mode == nil ? "正在读取连接设置…" : "正在保存连接设置…"
+    transportStatusLabel.textColor = .secondaryLabelColor
+    let settings = transportSettings
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+      let result = Result { try mode.map { try settings.save($0) } ?? settings.read() }
+      DispatchQueue.main.async {
+        guard let self else { return }
+        self.isUpdatingTransport = false
+        self.transportReloadButton.isEnabled = true
+        switch result {
+        case .success(let snapshot):
+          self.transportSnapshot = snapshot
+          self.transportStatusLabel.stringValue = snapshot.restriction ?? (mode == nil
+            ? "已保存：\(snapshot.mode?.displayName ?? "其他连接配置")"
+            : "已保存。手动重启 ChatGPT / Codex 并新建会话后使用。")
+          self.transportStatusLabel.textColor = snapshot.restriction == nil
+            ? .secondaryLabelColor : .systemOrange
+          self.transportPopup.toolTip = snapshot.configPath
+        case .failure(let error):
+          self.transportStatusLabel.stringValue = error.localizedDescription
+          self.transportStatusLabel.textColor = .systemRed
+          // A failed write may require a fresh read before another attempt is safe.
+          self.transportSnapshot = nil
+        }
+        if let snapshot = self.transportSnapshot {
+          self.transportPopup.isEnabled = snapshot.restriction == nil
+          if let selected = snapshot.mode,
+            let item = self.transportPopup.itemArray.first(where: {
+              $0.representedObject as? String == selected.rawValue
+            })
+          {
+            self.transportPopup.select(item)
+          } else {
+            self.transportPopup.select(nil)
+          }
+        } else {
+          self.transportPopup.select(nil)
+        }
+        self.resizeToFitContents()
+      }
     }
   }
 

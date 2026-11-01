@@ -250,7 +250,7 @@ final class CodexAppServerClient {
 }
 
 /// Owns one newline-delimited JSON-RPC child process and its deterministic shutdown.
-private final class AppServerSession {
+final class AppServerSession {
   /// Correlation identity disambiguating repeated numeric RPC IDs from different CLI children.
   private let sessionID = UUID().uuidString
 
@@ -335,8 +335,10 @@ private final class AppServerSession {
   }
 
   /// Sends one request and returns its result object while faithfully logging JSON and errors.
+  /// - Parameter redactResponse: Omits secret-bearing config results from logs, retaining metadata.
   func call(
     method: String, params: Any?,
+    redactResponse: Bool = false,
     authorizeSend: ((_ transmit: () throws -> Void) throws -> Void)? = nil
   ) throws -> [String: Any] {
     nextID += 1
@@ -387,7 +389,10 @@ private final class AppServerSession {
         guard id == requestID else {
           continue
         }
-        responseJSON = message.rawJSON
+        // Configuration reads can contain provider secrets; never copy those values to logs.
+        // The caller still receives the complete decoded result for local configuration editing.
+        responseJSON = redactResponse
+          ? "{\"id\":\(requestID),\"result\":\"[configuration redacted]\"}" : message.rawJSON
         if let rpcError = message.object["error"] as? [String: Any] {
           let code = (rpcError["code"] as? NSNumber)?.intValue ?? 0
           let text = rpcError["message"] as? String ?? "RPC \(code)"
