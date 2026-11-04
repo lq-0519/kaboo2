@@ -24,11 +24,14 @@ final class CodexAppServerClient {
 
   /// Revalidates login and the latest card list in the same child before using one specific card.
   /// Reconciliation always reuses the original card/key even if the card vanished or expired.
+  /// A scheduled trigger skips the expiry-lead gate but still requires an unexpired card and
+  /// must finish inside the captured schedule window.
   /// The authorization callback durably records intent and transmits under the coordinator lock,
   /// so disabling or editing settings cannot race a not-yet-submitted consume request.
   func consumeResetCredit(
     auth: CodexAuth, identity: CodexAutoUseIdentity, creditID: String,
     idempotencyKey: String, leadMinutes: Int, reconciling: Bool,
+    scheduledDue: Bool = false, scheduleTarget: Date? = nil,
     cancellation: ResetCreditConsumptionCancellation,
     authorizeSend: @escaping (_ transmit: () throws -> Void) throws -> Void
   ) throws -> ResetCreditConsumeOutcome {
@@ -54,10 +57,19 @@ final class CodexAppServerClient {
         authorizeSend: { transmit in
           if !reconciling {
             guard snapshot.availableCount > 0, let expiresAt,
-              expiresAt.timeIntervalSinceNow > 0,
-              expiresAt.timeIntervalSinceNow <= TimeInterval(leadMinutes * 60)
+              expiresAt.timeIntervalSinceNow > 0
             else {
               throw CodexQuotaError.transport("该重置卡已不可用、已过期或尚未到自动使用时间")
+            }
+            if scheduledDue {
+              guard let scheduleTarget,
+                Date().timeIntervalSince(scheduleTarget)
+                  <= ResetCreditAutoUseCoordinator.scheduleExecutionTolerance
+              else { throw CodexQuotaError.transport("已超过定时执行窗口，已取消提交") }
+            } else {
+              guard expiresAt.timeIntervalSinceNow <= TimeInterval(leadMinutes * 60) else {
+                throw CodexQuotaError.transport("该重置卡已不可用、已过期或尚未到自动使用时间")
+              }
             }
           }
           try authorizeSend(transmit)
