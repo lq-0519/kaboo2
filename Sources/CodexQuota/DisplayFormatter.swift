@@ -21,6 +21,20 @@ enum DisplayFormatter {
     return formatter
   }()
 
+  /// Compact expiry formatter keeps the card's metadata within the native two-column time list.
+  private static let creditExpiryDateFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.dateFormat = "M/d HH:mm"
+    return formatter
+  }()
+
+  /// Displays the service expiry in the current local timezone; unknown expiry cannot auto-use.
+  static func creditExpiry(_ expiresAt: Date?) -> String {
+    creditExpiryDateFormatter.timeZone = .current
+    return expiresAt.map { creditExpiryDateFormatter.string(from: $0) + " 到期" } ?? "有效期未知"
+  }
+
   /// Converts a remaining percentage to the integer form used by the status item.
   static func percent(_ value: Double?) -> String {
     guard let value, value.isFinite else {

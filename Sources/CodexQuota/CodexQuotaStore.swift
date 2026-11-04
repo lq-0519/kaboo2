@@ -61,7 +61,7 @@ final class CodexQuotaStore {
   /// Independent opt-in, cycle ledger and CLI sender for automatic reset greetings.
   private let greetingCoordinator = QuotaGreetingCoordinator()
 
-  /// Independent default-off automatic card use, driven only by successful credit refreshes.
+  /// Always-enabled card times plus optional expiry lead, driven by successful credit refreshes.
   private let creditAutoUseCoordinator = ResetCreditAutoUseCoordinator()
 
   /// Serial queue that prevents overlapping Codex child processes.
@@ -88,8 +88,8 @@ final class CodexQuotaStore {
   /// Queues a display-only refresh when consumption finishes during an already active query.
   private var postConsumptionRefreshPending = false
 
-  /// Replays one due-time planned refresh after a different in-flight reset-credit query finishes.
-  private var scheduledDueRefreshPending = false
+  /// Replays a settings display-only query after an older in-flight query finishes.
+  private var settingsCreditsRefreshPending = false
 
   /// Requests a fresh quota query after an older in-flight HTTPS response finishes.
   private var postConsumptionUsageRefreshPending = false
@@ -127,14 +127,11 @@ final class CodexQuotaStore {
   /// False when state storage is unsafe, another instance owns it, or shutdown has started.
   var creditAutoUseAvailable: Bool { creditAutoUseCoordinator.isAvailable }
 
-  /// Armed one-shot target, or nil when the fixed-time trigger is off.
-  var creditScheduledUseAt: Date? { creditAutoUseCoordinator.scheduledAt }
-
-  /// Fixed-time target, completion, miss or cancellation feedback for the settings section.
-  var creditScheduledUseStatus: String { creditAutoUseCoordinator.scheduledStatusText }
-
   /// Current operation state and the latest confirmed card result for settings.
   var creditAutoUseStatus: String { creditAutoUseCoordinator.statusText }
+
+  /// Sorted account-bound rows, with default/saved use times and pending-result feedback.
+  var creditUseRows: [ResetCreditUseRow] { creditAutoUseCoordinator.cardRows }
 
   /// Explicit opt-in for sending a greeting after a confirmed quota-cycle change.
   var resetGreetingsEnabled: Bool { greetingCoordinator.isEnabled }
@@ -233,10 +230,6 @@ final class CodexQuotaStore {
     }
     greetingCoordinator.onNeedsFreshSnapshot = { [weak self] in self?.refreshUsage() }
     creditAutoUseCoordinator.onChange = { [weak self] in self?.onCreditAutoUseChange?() }
-    creditAutoUseCoordinator.onScheduleDue = { [weak self] in
-      guard let self, !self.isShuttingDown else { return }
-      self.refreshCredits(scheduledDue: true)
-    }
     creditAutoUseCoordinator.onConsumed = { [weak self] in
       guard let self, !self.isShuttingDown else { return }
       if self.usageRefreshInFlight {
@@ -282,6 +275,17 @@ final class CodexQuotaStore {
     let interval = TimeInterval(creditsRefreshIntervalMinutes * 60)
     if now.timeIntervalSince(fetchedAt) >= interval {
       refreshCredits()
+    }
+  }
+
+  /// Shows cached rows immediately on settings open, then obtains a display-only fresh card list.
+  /// It initializes missing defaults but never evaluates consumption as a consequence of opening.
+  func refreshCreditsForSettings() {
+    guard !isShuttingDown else { return }
+    if creditsRefreshInFlight {
+      settingsCreditsRefreshPending = true
+    } else {
+      refreshCredits(allowAutomaticUse: false)
     }
   }
 
@@ -387,15 +391,11 @@ final class CodexQuotaStore {
     try creditAutoUseCoordinator.setLeadMinutes(minutes)
   }
 
-  /// Arms one fixed wall-clock instant and binds it to the current Codex login.
-  /// No immediate card query or consumption is performed when the user saves the target.
-  func setCreditScheduledUse(at date: Date) throws {
-    try creditAutoUseCoordinator.setScheduledUse(at: date, auth: try authStore.load())
-  }
-
-  /// Clears the fixed-time target without altering expiry-lead automation or card history.
-  func cancelCreditScheduledUse() throws {
-    try creditAutoUseCoordinator.cancelScheduledUse()
+  /// Saves one account/card's time without starting a query or an automatic use request.
+  func setCreditUseTime(accountKey: String, creditID: String, at date: Date) throws {
+    try creditAutoUseCoordinator.setCardUseTime(
+      accountKey: accountKey, creditID: creditID, at: date, auth: authStore.load()
+    )
   }
 
   /// Persists the greeting switch and seeds a fresh account-bound baseline after enabling it.
@@ -472,11 +472,9 @@ final class CodexQuotaStore {
 
   /// Performs a low-frequency query and checks automation only after a successful fresh snapshot.
   /// Display-only post-consumption queries suppress automatic selection to avoid cascading cards.
-  /// A scheduled trigger is replayed once if another query already owns the serial App Server.
-  private func refreshCredits(allowAutomaticUse: Bool = true, scheduledDue: Bool = false) {
+  private func refreshCredits(allowAutomaticUse: Bool = true) {
     guard !isShuttingDown else { return }
     if creditsRefreshInFlight {
-      if scheduledDue { scheduledDueRefreshPending = true }
       return
     }
     let auth: CodexAuth
@@ -484,7 +482,7 @@ final class CodexQuotaStore {
       auth = try authStore.load()
     } catch {
       creditsError = message(for: error, fallback: "重置卡查询失败")
-      creditAutoUseCoordinator.reportRefreshFailure(error, scheduledDue: scheduledDue)
+      creditAutoUseCoordinator.reportRefreshFailure(error)
       onChange?()
       return
     }
@@ -496,16 +494,33 @@ final class CodexQuotaStore {
         return
       }
       let result: Result<ResetCreditsSnapshot, Error>
+      // Bracket the existing query with local identity reads, retaining no ID-token bytes.
+      // A login changed during the query cannot authorize editable times or consumption.
+      let identityBeforeQuery = try? self.authStore.autoUseIdentity(for: auth)
+      let queryIdentity: CodexAutoUseIdentity?
       do {
-        result = .success(try self.appServerClient.readResetCredits(auth: auth))
+        result = .success(try self.appServerClient.readResetCredits(
+          auth: auth, identity: identityBeforeQuery
+        ))
+        let identityAfterQuery = try? self.authStore.autoUseIdentity(for: auth)
+        queryIdentity = identityBeforeQuery?.key == identityAfterQuery?.key
+          && identityBeforeQuery?.authPath == identityAfterQuery?.authPath
+          ? identityAfterQuery : nil
       } catch {
         result = .failure(error)
+        queryIdentity = nil
       }
       DispatchQueue.main.async {
         self.creditsRefreshInFlight = false
         guard !self.isShuttingDown else { return }
         switch result {
         case .success(let snapshot):
+          let currentIdentity = try? self.authStore.autoUseIdentity(for: auth)
+          let verifiedIdentity = queryIdentity?.key == currentIdentity?.key
+            && queryIdentity?.authPath == currentIdentity?.authPath ? queryIdentity : nil
+          self.creditAutoUseCoordinator.updateCards(
+            snapshot: snapshot, identity: verifiedIdentity
+          )
           self.creditNotificationCoordinator.observe(
             snapshot: snapshot,
             accountID: auth.accountID,
@@ -517,25 +532,26 @@ final class CodexQuotaStore {
           self.creditsSnapshot = snapshot
           self.creditsError = nil
           if allowAutomaticUse, !self.postConsumptionRefreshPending {
-            self.creditAutoUseCoordinator.observe(
-              snapshot: snapshot, auth: auth, client: self.appServerClient,
-              queue: self.appServerQueue, scheduledDue: scheduledDue
-            )
-          } else if scheduledDue {
-            self.scheduledDueRefreshPending = true
+            if verifiedIdentity != nil {
+              self.creditAutoUseCoordinator.observe(
+                snapshot: snapshot, auth: auth, client: self.appServerClient,
+                queue: self.appServerQueue
+              )
+            } else {
+              self.creditAutoUseCoordinator.reportRefreshFailure(
+                CodexQuotaError.transport("无法核对刷新时的登录身份，等待后续重置卡刷新")
+              )
+            }
           }
         case .failure(let error):
           self.creditsError = self.message(for: error, fallback: "重置卡查询失败")
-          self.creditAutoUseCoordinator.reportRefreshFailure(error, scheduledDue: scheduledDue)
+          self.creditAutoUseCoordinator.reportRefreshFailure(error)
         }
         self.onChange?()
-        if self.postConsumptionRefreshPending {
+        if self.postConsumptionRefreshPending || self.settingsCreditsRefreshPending {
           self.postConsumptionRefreshPending = false
+          self.settingsCreditsRefreshPending = false
           self.refreshCredits(allowAutomaticUse: false)
-        }
-        if self.scheduledDueRefreshPending {
-          self.scheduledDueRefreshPending = false
-          self.refreshCredits(scheduledDue: true)
         }
       }
     }

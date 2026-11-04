@@ -119,7 +119,7 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
   )
 
   /// Independent default-off expiry-lead switch, placed after its minute setting.
-  /// This switch never enables or cancels the separate fixed-time target.
+  /// This switch does not change any card's always-enabled saved time.
   private let creditAutoUseSwitch = NSSwitch()
 
   /// Positive integer-minute lead, saved on Return or when editing ends.
@@ -137,22 +137,22 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
   /// Opens dedicated full RPC/decision logs for the user's own subsequent testing.
   private let creditAutoUseLogButton = NSButton(title: "查看自动使用日志", target: nil, action: nil)
 
-  /// One-shot wall-clock picker; saving arms exactly this local date and time.
-  private let creditScheduledPicker = NSDatePicker()
+  /// Sorted native card rows with one always-enabled absolute time control per card.
+  private let creditCardsStack = NSStackView()
 
-  /// Independent switch after the date picker; on saves the chosen target and off cancels it.
-  /// Its displayed state follows the durable target, so one-shot completion turns it off.
-  private let creditScheduledSwitch = NSSwitch()
+  /// Retains controls by account/card identity so asynchronous feedback does not replace active edits.
+  private var creditCardViews: [String: ResetCreditTimeRowView] = [:]
 
-  /// Last durable target copied into the picker, preserving active edits during status refreshes.
-  /// Native editing actions save enabled schedules; disabled drafts wait for the switch to turn on.
-  private var creditScheduledDisplayedTarget: Date?
+  /// Ordered visible identities let metadata-only refreshes avoid rebuilding the native stack.
+  private var displayedCreditCardKeys: [String] = []
 
-  /// Explains one-shot semantics, including that a missed time is never backfilled.
-  private let creditScheduledHintLabel = NSTextField(wrappingLabelWithString: "")
+  /// Empty-state row is present only when there are no current cards or unresolved submissions.
+  private let creditCardsEmptyLabel = NSTextField(wrappingLabelWithString: "正在读取重置卡…")
 
-  /// Shows the armed target, the last scheduled result, a miss or a cancellation.
-  private let creditScheduledStatusLabel = NSTextField(wrappingLabelWithString: "")
+  /// Explains default times and immediate saving without adding another toggle or timer.
+  private let creditCardsHintLabel = NSTextField(wrappingLabelWithString:
+    "每张卡默认在到期前 30 分钟自动使用。修改时间后自动保存，用完后从列表移除。"
+  )
 
   /// Scrolls tall settings on smaller screens while keeping every native control reachable.
   private let settingsScrollView = NSScrollView()
@@ -327,26 +327,14 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     creditAutoUseLogButton.bezelStyle = .rounded
     creditAutoUseLogButton.controlSize = .small
 
-    creditScheduledPicker.datePickerStyle = .textFieldAndStepper
-    creditScheduledPicker.datePickerMode = .single
-    creditScheduledPicker.datePickerElements = [.yearMonthDay, .hourMinute]
-    creditScheduledPicker.minDate = Date()
-    creditScheduledPicker.dateValue = Date().addingTimeInterval(15 * 60)
-    creditScheduledPicker.setAccessibilityLabel("定时使用时间")
-    creditScheduledPicker.toolTip = "定时开启时，编辑完成后自动保存；关闭时修改时间不会开启定时。"
-    creditScheduledPicker.target = self
-    creditScheduledPicker.action = #selector(creditScheduledTimeChanged)
-    // Save after editing completes, rather than repeatedly arming partially entered dates.
-    creditScheduledPicker.isContinuous = false
-    creditScheduledPicker.cell?.sendsActionOnEndEditing = true
-    creditScheduledSwitch.target = self
-    creditScheduledSwitch.action = #selector(creditScheduledSwitchChanged)
-    creditScheduledSwitch.setAccessibilityLabel("指定时刻使用")
-    for label in [creditScheduledHintLabel, creditScheduledStatusLabel] {
+    creditCardsStack.orientation = .vertical
+    creditCardsStack.alignment = .leading
+    creditCardsStack.spacing = 8
+    creditCardsStack.setContentHuggingPriority(.required, for: .vertical)
+    for label in [creditCardsHintLabel, creditCardsEmptyLabel] {
       label.font = .systemFont(ofSize: 11)
       label.textColor = .secondaryLabelColor
     }
-    creditScheduledStatusLabel.maximumNumberOfLines = 4
 
     greetingSwitch.target = self
     greetingSwitch.action = #selector(greetingSwitchChanged)
@@ -481,15 +469,15 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
           creditAutoUseField, creditAutoUseStepper, settingLabel("分钟"), creditAutoUseSwitch,
         ]),
       ],
-      [
-        settingLabel("指定时刻使用"),
-        trailingControls([creditScheduledPicker, creditScheduledSwitch]),
-      ],
     ])
+    let creditCardsHeader = NSStackView(views: [
+      settingLabel("重置卡（最早到期优先）"), NSView(), settingLabel("自动使用时间"),
+    ])
+    creditCardsHeader.orientation = .horizontal
+    creditCardsHeader.alignment = .centerY
     let creditAutoUseSection = NSStackView(views: [
-      creditAutoUseGrid, creditAutoUseHintLabel, creditScheduledHintLabel,
-      trailingControls([creditAutoUseLogButton]), creditAutoUseStatusLabel,
-      creditScheduledStatusLabel,
+      creditAutoUseGrid, creditAutoUseHintLabel, creditCardsHeader, creditCardsStack,
+      creditCardsHintLabel, trailingControls([creditAutoUseLogButton]), creditAutoUseStatusLabel,
     ])
     creditAutoUseSection.orientation = .vertical
     creditAutoUseSection.alignment = .leading
@@ -610,8 +598,9 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       creditAutoUseSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
       creditAutoUseGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
       creditAutoUseHintLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-      creditScheduledHintLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
-      creditScheduledStatusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      creditCardsHeader.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      creditCardsStack.widthAnchor.constraint(equalTo: stack.widthAnchor),
+      creditCardsHintLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
       creditAutoUseStatusLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
       greetingSection.widthAnchor.constraint(equalTo: stack.widthAnchor),
       greetingGrid.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -625,7 +614,6 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
       firstCreditReminderField.widthAnchor.constraint(equalToConstant: 54),
       secondCreditReminderField.widthAnchor.constraint(equalToConstant: 54),
       creditAutoUseField.widthAnchor.constraint(equalToConstant: 76),
-      creditScheduledPicker.widthAnchor.constraint(equalToConstant: 210),
       fontSizePopup.widthAnchor.constraint(equalToConstant: 126),
       fiveHourStylePopup.widthAnchor.constraint(equalToConstant: 126),
       sevenDayStylePopup.widthAnchor.constraint(equalToConstant: 126),
@@ -648,11 +636,12 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     updateTransport()
   }
 
-  /// Refreshes login-item state whenever the retained window becomes visible.
+  /// Renders cached settings immediately and obtains a display-only fresh list on every opening.
   override func viewWillAppear() {
     super.viewWillAppear()
     render()
     updateTransport()
+    store.refreshCreditsForSettings()
     store.refreshResetNotificationAuthorizationStatus { [weak self] in
       self?.render()
     }
@@ -882,35 +871,66 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     creditAutoUseStatusLabel.stringValue = store.creditAutoUseStatus
     let interval = store.creditsRefreshIntervalMinutes
     creditAutoUseHintLabel.stringValue =
-      "到期前：开启后按提前分钟数使用即将到期的卡；随重置卡刷新检查（当前每 \(interval) 分钟）。"
+      "到期前：开启后只检查最早到期的可用卡。两种时间条件均随重置卡刷新检查（当前每 \(interval) 分钟）。"
     if store.creditAutoUseLeadMinutes <= interval {
       creditAutoUseHintLabel.stringValue += "\n提前时间不大于刷新间隔，可能错过使用窗口。"
     }
-    renderCreditScheduledUse()
+    renderCreditCardTimes()
+    resizeToFitContents()
   }
 
-  /// Renders the one-shot control independently of the lead-based switch and its minute field.
-  /// Only a changed durable target replaces the picker draft; other settings do not overwrite edits.
-  private func renderCreditScheduledUse() {
-    let available = store.creditAutoUseAvailable
-    let target = store.creditScheduledUseAt
-    creditScheduledSwitch.state = target != nil ? .on : .off
-    creditScheduledSwitch.isEnabled = available
-    creditScheduledPicker.minDate = Date()
-    creditScheduledPicker.isEnabled = available
-    if let target {
-      if target != creditScheduledDisplayedTarget, creditScheduledPicker.currentEditor() == nil {
-        creditScheduledPicker.dateValue = target
-        creditScheduledDisplayedTarget = target
+  /// Retains one date control per account/card and rebuilds ordering only when visible IDs change.
+  /// Successful use removes a row immediately; later successful queries add newly discovered cards.
+  private func renderCreditCardTimes() {
+    let rows = store.creditUseRows
+    let keys = rows.map { "\($0.accountKey):\($0.creditID)" }
+    for (row, key) in zip(rows, keys) {
+      let rowView: ResetCreditTimeRowView
+      if let existing = creditCardViews[key] {
+        rowView = existing
+      } else {
+        rowView = ResetCreditTimeRowView()
+        rowView.onTimeChanged = { [weak self] date in
+          guard let self else { return false }
+          var saved = false
+          self.applyCreditAutoUseChange {
+            try self.store.setCreditUseTime(
+              accountKey: row.accountKey, creditID: row.creditID, at: date
+            )
+            saved = true
+          }
+          return saved
+        }
+        creditCardViews[key] = rowView
       }
-    } else {
-      creditScheduledDisplayedTarget = nil
+      rowView.update(row)
     }
-    creditScheduledHintLabel.stringValue =
-      "定时：开启后到指定时间使用最早到期的一张可用卡，执行后自动关闭；错过时间不补执行。"
-      + "\n两项独立控制；同时开启时，可能分别使用一张卡。"
-    creditScheduledStatusLabel.stringValue = store.creditScheduledUseStatus
-    resizeToFitContents()
+    if displayedCreditCardKeys != keys || creditCardsStack.arrangedSubviews.isEmpty {
+      for child in creditCardsStack.arrangedSubviews {
+        if let rowView = child as? ResetCreditTimeRowView {
+          rowView.stackWidthConstraint?.isActive = false
+          rowView.stackWidthConstraint = nil
+        }
+        creditCardsStack.removeArrangedSubview(child)
+        child.removeFromSuperview()
+      }
+      if rows.isEmpty {
+        creditCardsStack.addArrangedSubview(creditCardsEmptyLabel)
+      } else {
+        for key in keys {
+          guard let rowView = creditCardViews[key] else { continue }
+          creditCardsStack.addArrangedSubview(rowView)
+          // A retained row is removed and re-added only when ordering changes.
+          let width = rowView.widthAnchor.constraint(equalTo: creditCardsStack.widthAnchor)
+          width.isActive = true
+          rowView.stackWidthConstraint = width
+        }
+      }
+      displayedCreditCardKeys = keys
+      creditCardViews = creditCardViews.filter { keys.contains($0.key) }
+    }
+    creditCardsEmptyLabel.stringValue = store.creditsError.map { "读取失败：\($0)" }
+      ?? (store.creditsSnapshot == nil ? "正在读取重置卡…" : "当前没有可用重置卡")
   }
 
   /// Applies an automatic-use setting and exposes persistence/authentication errors inline.
@@ -936,8 +956,7 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
     creditAutoUseStepper.integerValue = store.creditAutoUseLeadMinutes
   }
 
-  /// Binds only expiry-lead automation to the current login without changing a fixed-time target.
-  /// Disabling invalidates unsent lead-based work while the scheduled switch remains independent.
+  /// Binds only global expiry lead to the current login; every card's saved time remains enabled.
   @objc private func creditAutoUseSwitchChanged() {
     applyCreditAutoUseChange {
       try store.setCreditAutoUseEnabled(creditAutoUseSwitch.state == .on)
@@ -953,36 +972,6 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
   @objc private func creditAutoUseStepperChanged() {
     creditAutoUseField.integerValue = creditAutoUseStepper.integerValue
     commitCreditAutoUseMinutes()
-  }
-
-  /// Turns fixed-time use on by saving the picker date, or off by cancelling its one-shot target.
-  /// Persistence/authentication failures restore the switch from durable state without consuming a card.
-  @objc private func creditScheduledSwitchChanged() {
-    let enabled = creditScheduledSwitch.state == .on
-    let target = creditScheduledPicker.dateValue
-    applyCreditAutoUseChange {
-      if enabled {
-        try store.setCreditScheduledUse(at: target)
-      } else {
-        try store.cancelCreditScheduledUse()
-      }
-    }
-  }
-
-  /// Automatically saves a completed date edit only while the fixed-time switch is enabled.
-  /// Unchanged dates do not rearm timers or write the ledger; failed saves restore the active target.
-  @objc private func creditScheduledTimeChanged() {
-    guard let previousTarget = store.creditScheduledUseAt else { return }
-    let target = creditScheduledPicker.dateValue
-    guard target != previousTarget else { return }
-    applyCreditAutoUseChange {
-      do {
-        try store.setCreditScheduledUse(at: target)
-      } catch {
-        creditScheduledPicker.dateValue = previousTarget
-        throw error
-      }
-    }
   }
 
   /// Opens the dedicated log, or its containing directory before the first log file exists.
@@ -1328,4 +1317,103 @@ final class SettingsViewController: NSViewController, NSTextFieldDelegate {
 private final class SettingsContentView: NSView {
   /// Uses a top-left origin so initial scrolling and expanding status rows preserve reading order.
   override var isFlipped: Bool { true }
+}
+
+/// Compact native two-column card/time row without a scheduling toggle.
+/// One retained instance owns each card's editor so unrelated async feedback preserves typed dates.
+private final class ResetCreditTimeRowView: NSView {
+  /// Callback saves the edited instant for this row's captured account/card; false restores saved time.
+  var onTimeChanged: ((Date) -> Bool)?
+  /// Explicit parent-width constraint is replaced when sorted rows are removed and reinserted.
+  var stackWidthConstraint: NSLayoutConstraint?
+  /// Service title plus ID suffix identifies cards with equal titles.
+  private let titleLabel = NSTextField(labelWithString: "")
+  /// Compact local expiry and optional reconciliation/stale-data feedback.
+  private let detailLabel = NSTextField(wrappingLabelWithString: "")
+  /// Native absolute date/minute editor saves only when editing ends or the stepper commits.
+  private let picker = NSDatePicker()
+  /// Missing-expiry cards retain their row with a plain unavailable-time label.
+  private let unavailableLabel = NSTextField(labelWithString: "无法设置")
+  /// Latest persisted time remains available to restore an authentication or save failure.
+  private var savedTime: Date?
+  /// Prevents synchronous re-rendering from replacing the date while its save action is active.
+  private var isCommitting = false
+
+  /// Builds a 210-point native date control alongside flexible, truncating card metadata.
+  init() {
+    super.init(frame: .zero)
+    translatesAutoresizingMaskIntoConstraints = false
+    titleLabel.font = .systemFont(ofSize: 12, weight: .medium)
+    titleLabel.lineBreakMode = .byTruncatingTail
+    titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    detailLabel.font = .systemFont(ofSize: 11)
+    detailLabel.textColor = .secondaryLabelColor
+    detailLabel.maximumNumberOfLines = 2
+    detailLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    let metadata = NSStackView(views: [titleLabel, detailLabel])
+    metadata.orientation = .vertical
+    metadata.alignment = .leading
+    metadata.spacing = 3
+    metadata.translatesAutoresizingMaskIntoConstraints = false
+    picker.datePickerStyle = .textFieldAndStepper
+    picker.datePickerMode = .single
+    picker.datePickerElements = [.yearMonthDay, .hourMinute]
+    picker.isContinuous = false
+    picker.cell?.sendsActionOnEndEditing = true
+    picker.target = self
+    picker.action = #selector(timeChanged)
+    picker.translatesAutoresizingMaskIntoConstraints = false
+    unavailableLabel.font = .systemFont(ofSize: 11)
+    unavailableLabel.textColor = .secondaryLabelColor
+    unavailableLabel.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(metadata)
+    addSubview(picker)
+    addSubview(unavailableLabel)
+    NSLayoutConstraint.activate([
+      metadata.leadingAnchor.constraint(equalTo: leadingAnchor),
+      metadata.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+      metadata.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+      metadata.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -220),
+      titleLabel.widthAnchor.constraint(equalTo: metadata.widthAnchor),
+      detailLabel.widthAnchor.constraint(equalTo: metadata.widthAnchor),
+      picker.trailingAnchor.constraint(equalTo: trailingAnchor),
+      picker.widthAnchor.constraint(equalToConstant: 210),
+      picker.centerYAnchor.constraint(equalTo: centerYAnchor),
+      unavailableLabel.trailingAnchor.constraint(equalTo: trailingAnchor),
+      unavailableLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+      heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
+    ])
+    setContentHuggingPriority(.required, for: .vertical)
+  }
+
+  /// Programmatic rows are never constructed from an archived interface.
+  required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+  /// Updates service metadata and saved state while leaving an active native date edit intact.
+  func update(_ row: ResetCreditUseRow) {
+    titleLabel.stringValue = "\(row.title) · …\(row.creditID.suffix(6))"
+    detailLabel.stringValue = DisplayFormatter.creditExpiry(row.expiresAt)
+      + (row.statusText.isEmpty ? "" : "\n\(row.statusText)")
+    toolTip = "\(row.title)\n到期：\(DisplayFormatter.exact(row.expiresAt))\nID：\(row.creditID)"
+    savedTime = row.useAt
+    picker.isHidden = row.useAt == nil
+    unavailableLabel.isHidden = row.useAt != nil
+    picker.isEnabled = row.canEdit
+    picker.setAccessibilityLabel("\(row.title) 自动使用时间")
+    picker.toolTip = "编辑完成后自动保存；必须早于到期时间，随重置卡刷新执行。"
+    if let time = row.useAt, picker.currentEditor() == nil, !isCommitting {
+      picker.dateValue = time
+    }
+  }
+
+  /// Saves one completed time edit and restores the last persisted value after any failure.
+  @objc private func timeChanged() {
+    guard !isCommitting, picker.isEnabled, let savedTime, picker.dateValue != savedTime else { return }
+    isCommitting = true
+    defer { isCommitting = false }
+    let date = picker.dateValue
+    if onTimeChanged?(date) != true {
+      picker.dateValue = self.savedTime ?? savedTime
+    }
+  }
 }

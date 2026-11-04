@@ -1,96 +1,70 @@
 import Darwin
 import Foundation
 
-/// Refresh-driven, opt-in credit consumption with durable per-account/card deduplication.
-/// All ledger access is serialized by one lock; RPC work uses the store's existing serial queue.
+/// Evaluates always-enabled per-card times and optional expiry lead only after successful queries.
+/// One lock protects the durable account/card ledger; RPC work uses the store's existing serial queue.
 final class ResetCreditAutoUseCoordinator {
-  /// Largest accepted integer-minute lead, allowing up to one year without arithmetic overflow.
+  /// Largest accepted whole-minute lead, allowing up to one year without arithmetic overflow.
   static let maximumLeadMinutes = 525_600
-
-  /// Tolerance for ordinary timer scheduling latency; any later fire is recorded as missed.
-  /// The user explicitly chose not to backfill a schedule that was skipped by sleep or app exit.
-  static let scheduleExecutionTolerance: TimeInterval = 60
-
-  /// Short delay between due-time credit refresh retries while still inside the tolerance window.
-  private static let scheduleRefreshRetryDelay: TimeInterval = 20
-
-  /// Maximum fresh credit queries attempted for one scheduled trigger.
-  private static let maximumScheduleRefreshAttempts = 3
-
-  /// Dedicated diagnostics retain five approximately 5 MiB generations for user-driven testing.
+  /// Every first-seen finite-expiry card defaults to use thirty minutes before its service expiry.
+  private static let defaultLead: TimeInterval = 30 * 60
+  /// Dedicated diagnostics retain five approximately 5 MiB generations for user-driven inspection.
   static let log = RPCFileLogger(
     filename: "reset-credit-auto-use.log", maximumBytes: 5_242_880, retainedGenerations: 4
   )
 
-  /// Protects state, configuration epochs and the final persistence/transmission boundary.
+  /// Serializes ledger access and the final durable-write/transmission boundary.
   private let lock = NSLock()
-  /// Atomic application-owned ledger; contains no OAuth or ID tokens.
+  /// Atomic private ledger location containing times and history, never OAuth or ID tokens.
   private let stateURL: URL
-  /// Saved opt-in, account binding, completed cards and unresolved operations.
+  /// Persisted global lead setting, account-bound card times and exact consumption identities.
   private var state = AutoUseState()
-  /// Lifetime exclusive lock prevents competing utility instances from selecting the same card.
+  /// Lifetime exclusive lock prevents competing utility instances from consuming the same card.
   private var lockDescriptor: Int32 = -1
-  /// Any state corruption or durable-write failure pauses requests instead of forgetting history.
+  /// Corruption or durable-write failure blocks all submissions instead of forgetting history.
   private var storageError: String?
-  /// Diagnostic revision across both modes, account changes and shutdown.
-  /// Per-mode epochs below independently authorize queued work after setting edits.
-  private var configurationEpoch = 0
-  /// Invalidates only expiry-lead work after its switch or minutes change.
-  /// Fixed-time setting edits leave this value unchanged so the two switches remain independent.
+  /// An incompatible CLI pauses both conditions until the application is restarted after updating.
+  private var protocolError: String?
+  /// Invalidates queued lead work without cancelling another card's saved-time condition.
   private var leadConfigurationEpoch = 0
-  /// Invalidates only fixed-time work after its target or switch changes.
-  /// Lead-setting edits do not cancel a scheduled submission that is still being prepared.
-  private var scheduleConfigurationEpoch = 0
-  /// Blocks overlapping refresh-driven selections until the current operation finishes.
+  /// Only one new submission or original-key reconciliation may be active at a time.
   private var inFlight = false
-  /// Shutdown rejects queued sends and closes the bounded active child.
+  /// Shutdown rejects queued sends while accepted results may still be persisted.
   private var isShuttingDown = false
-  /// Native process cleanup for the one current automatic operation.
+  /// Native cleanup for the single active bounded App Server child.
   private var cancellation: ResetCreditConsumptionCancellation?
-  /// One-shot wall-clock timer for the optional fixed-time trigger; nil while no target exists.
-  private var scheduleTimer: Timer?
-  /// Fresh credit refresh attempts already spent on the current scheduled trigger.
-  private var scheduleAttempts = 0
-  /// Wall-clock instant when the current target was armed, used to detect sleep across the target.
-  private var scheduleArmedAt: Date?
-  /// Monotonic uptime when armed; uptime excludes sleep on macOS and detects skipped wall time.
-  private var scheduleArmedUptime: TimeInterval?
-  /// Main-thread callback owned by the store to run one fresh credit refresh at the target time.
-  var onScheduleDue: (() -> Void)?
-  /// Main-thread UI feedback, dispatched without holding the ledger lock.
+  /// Last successful service rows retained for display during transient refresh failures.
+  private var cachedCards: [ResetCredit] = []
+  /// Verified account of the cached rows, kept independently of the opt-in global lead binding.
+  private var cardsIdentity: CodexAutoUseIdentity?
+  /// Failed or identity-mismatched queries disable edits without deleting the previous display.
+  private var cardsAreVerified = false
+  /// Main-thread settings feedback; callbacks are always dispatched outside the state lock.
   var onChange: (() -> Void)?
-  /// Refreshes cards/usage after confirmed consumption; never directly selects another card.
+  /// Requests display-only card and quota refreshes after confirmed use, never another selection.
   var onConsumed: (() -> Void)?
 
-  /// Default-off preference, read safely by the AppKit settings controller.
+  /// Optional global earliest-expiry mode retains its existing default-off preference.
   var isEnabled: Bool { synchronized { state.enabled } }
-  /// Whole-minute setting, independent of the integer-hour notification reminders.
+  /// Whole-minute global lead, independent of each card's always-enabled absolute time.
   var leadMinutes: Int { synchronized { state.leadMinutes } }
-  /// Storage/instance failures disable the switch; ordinary RPC failures remain inspectable.
-  var isAvailable: Bool { synchronized { storageError == nil && !isShuttingDown } }
-  /// Armed one-shot target; nil means the fixed-time trigger is off.
-  var scheduledAt: Date? { synchronized { state.scheduledAt } }
-  /// Fixed-time feedback showing the armed target, the last completion or the missed reason.
-  var scheduledStatusText: String {
-    synchronized {
-      if let storageError { return storageError }
-      if let target = state.scheduledAt {
-        return "已设定：\(DisplayFormatter.exact(target)) 使用当时最早到期的一张卡。"
-      }
-      return state.scheduledLastResult ?? "尚未设置定时使用。"
-    }
+  /// Storage, CLI or lifetime-lock failures prevent editing or executing automatic use.
+  var isAvailable: Bool {
+    synchronized { storageError == nil && protocolError == nil && !isShuttingDown }
   }
-  /// Settings feedback includes the most recent confirmed result across application restarts.
+  /// Earliest-expiry-first settings rows; locally terminal cards disappear even in a stale snapshot.
+  var cardRows: [ResetCreditUseRow] { synchronized { makeCardRows(now: Date()) } }
+  /// Current feedback and the last confirmed use survive ordinary refreshes and app restarts.
   var statusText: String {
     synchronized {
       if let storageError { return storageError }
-      let prefix = state.enabled ? "" : "到期前自动使用已关闭。"
-      return prefix + state.notice + (state.lastCompletion.map { "\n\($0)" } ?? "")
+      if let protocolError { return protocolError }
+      return state.notice + (state.lastCompletion.map { "\n\($0)" } ?? "")
     }
   }
 
-  /// Loads and validates the exclusive ledger without launching any child or consuming a card.
-  /// Pending operations remain pending after restart; a missing file starts with automation off.
+  /// Loads the exclusive ledger and migrates only a legacy time tied to an explicit known card.
+  /// Legacy global times cannot identify a card and are discarded; all operation history is retained.
   init() {
     let directory = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support/CodexQuota", isDirectory: true)
@@ -107,337 +81,276 @@ final class ResetCreditAutoUseCoordinator {
         throw CodexQuotaError.transport("另一个 Codex Quota 实例正在管理自动使用")
       }
       if FileManager.default.fileExists(atPath: stateURL.path) {
-        let data = try Data(contentsOf: stateURL)
-        let loaded = try JSONDecoder().decode(AutoUseState.self, from: data)
-        guard loaded.version == 1 || loaded.version == 2,
+        let loaded = try JSONDecoder().decode(AutoUseState.self, from: Data(contentsOf: stateURL))
+        guard (1...4).contains(loaded.version),
           (1...Self.maximumLeadMinutes).contains(loaded.leadMinutes),
-          loaded.scheduledAt.map({ $0.timeIntervalSince1970.isFinite }) ?? true,
-          !loaded.enabled && loaded.scheduledAt == nil
-            || (loaded.accountKey?.isEmpty == false && loaded.authPath?.isEmpty == false),
+          !loaded.enabled || (loaded.accountKey?.isEmpty == false && loaded.authPath?.isEmpty == false),
+          loaded.cardUseTimes.allSatisfy({ key, time in
+            key == Self.recordKey(accountKey: time.accountKey, creditID: time.creditID)
+              && !time.accountKey.isEmpty && !time.creditID.isEmpty && !time.authPath.isEmpty
+              && time.expiresAt.timeIntervalSince1970.isFinite
+              && time.useAt.timeIntervalSince1970.isFinite
+          }),
           loaded.records.allSatisfy({ key, record in
             key == Self.recordKey(accountKey: record.accountKey, creditID: record.creditID)
-              && !record.creditID.isEmpty && !record.idempotencyKey.isEmpty
-              && record.attempts >= 0 && record.expiresAt.timeIntervalSince1970.isFinite
+              && !record.accountKey.isEmpty && !record.creditID.isEmpty
+              && !record.idempotencyKey.isEmpty && record.attempts >= 0
+              && record.expiresAt.timeIntervalSince1970.isFinite
           }),
           Dictionary(grouping: loaded.records.values.filter { $0.phase == .pending },
             by: { $0.accountKey }).values.allSatisfy({ $0.count <= 1 })
         else { throw CodexQuotaError.transport("自动使用记录版本或内容不兼容") }
         state = loaded
+        state.version = 4
+        if loaded.version < 4 {
+          state.notice = "已升级为逐卡自动使用，等待重置卡刷新"
+          try persist()
+        }
       }
       logEvent("ledger_loaded")
-      // A target that passed while the app was not running is never backfilled by design.
-      if let target = state.scheduledAt, Date() >= target {
-        state.scheduledAt = nil
-        state.scheduledLastResult = "已错过 \(DisplayFormatter.exact(target)) 的定时使用（应用当时未运行）。"
-        do { try persist() } catch {}
-        logEvent("schedule_missed", fields: [
-          "scheduledAt": target.timeIntervalSince1970, "reason": "app_not_running",
-        ])
-      }
-      armScheduleTimer()
     } catch {
       storageError = "自动使用暂不可用：\(error.localizedDescription)"
-      logEvent("ledger_unavailable", error: error)
+      logEvent("ledger_load_failed", error: error)
     }
   }
 
-  /// Releases the lifetime lock after the application has stopped its automatic work.
+  /// Releases only the lifetime file lock; durable card settings and histories remain on disk.
   deinit {
-    scheduleTimer?.invalidate()
-    cancellation?.cancel()
     if lockDescriptor >= 0 { Darwin.close(lockDescriptor) }
   }
 
-  /// Binds the expiry-lead switch to the current login without changing a fixed-time target.
-  /// Disabling invalidates only unsent lead work and preserves completed/uncertain card history.
+  /// Updates the display and initializes new cards even for a display-only settings-page query.
+  /// A verified query binds defaults to its current account; unrelated accounts retain their history.
+  /// Only changed defaults/metadata are persisted, avoiding a ledger write on every refresh.
+  func updateCards(snapshot: ResetCreditsSnapshot, identity: CodexAutoUseIdentity?) {
+    synchronized {
+      guard let identity else {
+        cardsAreVerified = false
+        notifyChange()
+        return
+      }
+      cachedCards = snapshot.items
+      cardsIdentity = identity
+      cardsAreVerified = true
+      guard storageError == nil, !isShuttingDown else { notifyChange(); return }
+      do {
+        if state.enabled,
+          state.accountKey != identity.key || state.authPath != identity.authPath
+        {
+          try pauseLeadForAccountChange()
+        }
+        var changed = false
+        for card in snapshot.items {
+          guard card.status == "available", let expiry = card.expiresAt,
+            expiry.timeIntervalSince1970.isFinite, expiry > Date()
+          else { continue }
+          let key = Self.recordKey(accountKey: identity.key, creditID: card.id)
+          let phase = state.records[key]?.phase
+          guard phase != .used && phase != .unavailable else { continue }
+          if var time = state.cardUseTimes[key] {
+            if time.title != card.title || time.expiresAt != expiry || time.authPath != identity.authPath {
+              if !time.isCustom { time.useAt = expiry.addingTimeInterval(-Self.defaultLead) }
+              time.title = card.title
+              time.expiresAt = expiry
+              time.authPath = identity.authPath
+              state.cardUseTimes[key] = time
+              changed = true
+            }
+          } else {
+            state.cardUseTimes[key] = ResetCreditUseTime(
+              creditID: card.id, title: card.title, expiresAt: expiry,
+              accountKey: identity.key, authPath: identity.authPath,
+              useAt: expiry.addingTimeInterval(-Self.defaultLead)
+            )
+            changed = true
+            logEvent("card_time_initialized", fields: [
+              "cardAccountKey": identity.key, "creditID": card.id,
+              "useAt": expiry.addingTimeInterval(-Self.defaultLead).timeIntervalSince1970,
+            ])
+          }
+        }
+        if changed { try persist() }
+      } catch {
+        logEvent("card_times_update_failed", error: error)
+      }
+      notifyChange()
+    }
+  }
+
+  /// Saves one row's time immediately after editing; it does not query or consume the card.
+  /// Past times are allowed and become due on the next successful poll, provided the card is unexpired.
+  func setCardUseTime(accountKey: String, creditID: String, at date: Date, auth: CodexAuth) throws {
+    try synchronized {
+      try requireStorage()
+      let identity = try CodexAuthStore().autoUseIdentity(for: auth)
+      let key = Self.recordKey(accountKey: accountKey, creditID: creditID)
+      guard cardsAreVerified, cardsIdentity?.key == identity.key,
+        cardsIdentity?.authPath == identity.authPath, identity.key == accountKey,
+        let row = makeCardRows(now: Date()).first(where: { $0.creditID == creditID }),
+        row.canEdit, let expiry = row.expiresAt, var time = state.cardUseTimes[key]
+      else { throw CodexQuotaError.transport("该卡暂不可编辑，请等待当前账号的重置卡刷新") }
+      guard date.timeIntervalSince1970.isFinite, date < expiry else {
+        throw CodexQuotaError.transport("自动使用时间必须早于这张卡的到期时间")
+      }
+      guard time.useAt != date || !time.isCustom else { return }
+      time.useAt = date
+      time.isCustom = true
+      state.cardUseTimes[key] = time
+      state.notice = "已保存 \(time.title) 的自动使用时间，等待后续刷新"
+      try persist()
+      logEvent("card_time_changed", fields: [
+        "cardAccountKey": accountKey, "creditID": creditID, "useAt": date.timeIntervalSince1970,
+      ])
+      notifyChange()
+    }
+  }
+
+  /// Binds the optional earliest-expiry switch to the current login without changing card times.
+  /// Disabling rejects only unsent lead work; pending requests keep their exact reconciliation key.
   func setEnabled(_ enabled: Bool, auth: CodexAuth?) throws {
     try synchronized {
       try requireStorage()
       if enabled {
-        guard !inFlight else { throw CodexQuotaError.transport("正在核对使用结果，请稍后开启") }
         guard let auth else { throw CodexQuotaError.notSignedIn }
         let identity = try CodexAuthStore().autoUseIdentity(for: auth)
         state.accountKey = identity.key
         state.authPath = identity.authPath
       }
-      configurationEpoch += 1
       leadConfigurationEpoch += 1
       state.enabled = enabled
       state.notice = enabled
-        ? "到期前自动使用已开启，等待下一次重置卡刷新"
-        : (inFlight ? "已停止到期前的后续提交，正在核对使用结果" : "可按分钟设置到期前的自动使用时间")
+        ? "到期前自动使用已开启；每张卡的指定时间也继续生效"
+        : "到期前自动使用已关闭；每张卡仍按指定时间自动使用"
       try persist()
-      logEvent("settings_enabled_changed", fields: ["triggerMode": "expiry_lead"])
+      logEvent("settings_enabled_changed")
       notifyChange()
     }
   }
 
-  /// Saves an exact integer-minute threshold and invalidates work queued under the old threshold.
-  /// History and unresolved idempotency keys survive all setting edits.
+  /// Saves the bounded integer-minute lead for future successful polls without changing any card time.
   func setLeadMinutes(_ minutes: Int) throws {
     try synchronized {
       try requireStorage()
       let bounded = min(Self.maximumLeadMinutes, max(1, minutes))
       guard bounded != state.leadMinutes else { return }
-      configurationEpoch += 1
       leadConfigurationEpoch += 1
       state.leadMinutes = bounded
       try persist()
-      logEvent("settings_lead_changed", fields: ["triggerMode": "expiry_lead"])
+      logEvent("settings_lead_changed")
       notifyChange()
     }
   }
 
-  /// Arms one fixed wall-clock instant for one earliest-expiring card, independent of lead mode.
-  /// The target is persisted before the local timer is installed; a past instant is rejected.
-  func setScheduledUse(at date: Date, auth: CodexAuth?) throws {
-    try synchronized {
-      try requireStorage()
-      guard !inFlight else { throw CodexQuotaError.transport("正在核对使用结果，请稍后设置定时") }
-      guard let auth else { throw CodexQuotaError.notSignedIn }
-      let identity = try CodexAuthStore().autoUseIdentity(for: auth)
-      guard date.timeIntervalSince(Date()) > Self.scheduleExecutionTolerance else {
-        throw CodexQuotaError.transport("定时使用时间必须晚于当前时间")
-      }
-      configurationEpoch += 1
-      scheduleConfigurationEpoch += 1
-      state.accountKey = identity.key
-      state.authPath = identity.authPath
-      state.scheduledAt = date
-      state.scheduledLastResult = nil
-      scheduleAttempts = 0
-      try persist()
-      armScheduleTimer()
-      logEvent("schedule_armed", fields: [
-        "scheduledAt": date.timeIntervalSince1970,
-        "secondsUntil": date.timeIntervalSince(Date()),
-      ])
-      notifyChange()
-    }
-  }
-
-  /// Clears one one-shot target without touching completed or uncertain card history.
-  func cancelScheduledUse() throws {
-    try synchronized {
-      try requireStorage()
-      guard let cancelledTarget = state.scheduledAt else { return }
-      configurationEpoch += 1
-      scheduleConfigurationEpoch += 1
-      state.scheduledAt = nil
-      state.scheduledLastResult = "已取消定时使用。"
-      scheduleAttempts = 0
-      scheduleArmedAt = nil
-      scheduleArmedUptime = nil
-      scheduleTimer?.invalidate()
-      scheduleTimer = nil
-      try persist()
-      logEvent("schedule_cancelled", fields: [
-        "triggerMode": "scheduled",
-        "cancelledTargetAt": cancelledTarget.timeIntervalSince1970,
-      ])
-      notifyChange()
-    }
-  }
-
-  /// Exposes failed authentication/query refreshes without treating cached cards as new evidence.
-  /// A scheduled trigger gets a few short in-window retries; anything later becomes a recorded miss.
-  func reportRefreshFailure(_ error: Error, scheduledDue: Bool = false) {
+  /// Keeps stale display rows but blocks editing/selection until a successful identity-verified query.
+  /// Failure never starts a retry timer or interprets cached cards as fresh execution evidence.
+  func reportRefreshFailure(_ error: Error) {
     synchronized {
       guard storageError == nil, !isShuttingDown else { return }
-      if scheduledDue, let target = state.scheduledAt {
-        let now = Date()
-        let withinWindow = now.timeIntervalSince(target) <= Self.scheduleExecutionTolerance
-        if scheduleAttempts < Self.maximumScheduleRefreshAttempts, withinWindow {
-          logEvent("schedule_refresh_retry", fields: [
-            "scheduledAt": target.timeIntervalSince1970,
-            "attempt": scheduleAttempts,
-            "retryDelaySeconds": Self.scheduleRefreshRetryDelay,
-          ], error: error)
-          armScheduleTimer(retryDelay: Self.scheduleRefreshRetryDelay)
-          notifyChange()
-          return
-        }
-        markScheduleMissed(target: target, reason: "refresh_failed", error: error)
-        return
-      }
-      guard state.enabled else { return }
-      state.notice = "重置卡刷新失败，自动使用已暂停：\(error.localizedDescription)"
+      cardsAreVerified = false
+      state.notice = "重置卡刷新失败，等待后续成功刷新：\(error.localizedDescription)"
       logEvent("credit_refresh_failed", error: error)
       notifyChange()
     }
   }
 
-  /// Checks only a successful refresh, selects at most one earliest-expiring card, and dispatches it.
-  /// An unresolved request takes priority over all new cards and retains its original idempotency key.
-  /// A scheduled evaluation ignores the expiry lead but still requires an unexpired card.
+  /// Evaluates both conditions on a successful existing poll and dispatches at most one exact card.
+  /// Original-key reconciliation precedes every new card, even when global lead mode is disabled.
   func observe(
     snapshot: ResetCreditsSnapshot, auth: CodexAuth,
-    client: CodexAppServerClient, queue: DispatchQueue,
-    scheduledDue: Bool = false
+    client: CodexAppServerClient, queue: DispatchQueue
   ) {
     synchronized {
-      guard state.enabled || scheduledDue else {
-        logEvent("refresh_skipped", fields: ["reason": "disabled_or_unavailable"])
+      guard storageError == nil, protocolError == nil, !isShuttingDown, !inFlight else {
+        logEvent("refresh_skipped", fields: ["reason": "unavailable_or_in_flight"])
         return
       }
-      guard !scheduledDue || state.scheduledAt != nil else {
-        logEvent("refresh_skipped", fields: ["reason": "schedule_not_armed"])
-        return
-      }
-      guard storageError == nil, !isShuttingDown else {
-        if scheduledDue, let target = state.scheduledAt {
-          markScheduleMissed(target: target, reason: "unavailable")
-        }
-        logEvent("refresh_skipped", fields: ["reason": "disabled_or_unavailable"])
-        return
-      }
-      guard !inFlight else {
-        logEvent("refresh_skipped", fields: ["reason": "operation_in_flight"])
-        if scheduledDue {
-          armScheduleTimer(retryDelay: Self.scheduleRefreshRetryDelay)
-        }
-        return
-      }
-      let scheduleTarget = scheduledDue ? state.scheduledAt : nil
       do {
         let identity = try CodexAuthStore().autoUseIdentity(for: auth)
-        guard identity.key == state.accountKey, identity.authPath == state.authPath else {
-          try pauseForAccountChange()
-          return
-        }
+        guard cardsAreVerified, cardsIdentity?.key == identity.key,
+          cardsIdentity?.authPath == identity.authPath
+        else { throw CodexQuotaError.transport("无法核对当前重置卡列表的登录身份") }
         let now = Date()
-        if scheduledDue, let target = scheduleTarget,
-          now.timeIntervalSince(target) > Self.scheduleExecutionTolerance
-        {
-          markScheduleMissed(target: target, reason: "refresh_late")
-          return
-        }
         let pending = state.records.values.first {
           $0.accountKey == identity.key && $0.phase == .pending
         }
-        var selected: AutoUseRecord?
+        let terminalIDs = Set(state.records.values.filter {
+          $0.accountKey == identity.key && ($0.phase == .used || $0.phase == .unavailable)
+        }.map { $0.creditID })
+        let eligible = snapshot.items.filter {
+          $0.status == "available" && !terminalIDs.contains($0.id)
+            && $0.expiresAt.map { $0.timeIntervalSince1970.isFinite && $0 > now } == true
+        }.sorted {
+          ($0.expiresAt ?? .distantFuture, $0.id) < ($1.expiresAt ?? .distantFuture, $1.id)
+        }
+        var selected = pending
+        var trigger: ResetCreditUseTrigger = .reconciliation
         var decisions: [[String: Any]] = []
-        if let pending {
-          selected = pending
-        } else {
-          for card in snapshot.items.sorted(by: {
-            ($0.expiresAt ?? .distantFuture, $0.id) < ($1.expiresAt ?? .distantFuture, $1.id)
-          }) {
+        if pending == nil, snapshot.availableCount > 0 {
+          for card in eligible {
             let key = Self.recordKey(accountKey: identity.key, creditID: card.id)
-            let existing = state.records[key]
+            guard let expiry = card.expiresAt else { continue }
+            let time = state.cardUseTimes[key]
+            let dueTime = time.map {
+              $0.authPath == identity.authPath && $0.useAt <= now && $0.useAt < expiry
+            } ?? false
+            let dueLead = state.enabled && state.accountKey == identity.key
+              && state.authPath == identity.authPath && eligible.first?.id == card.id
+              && expiry.timeIntervalSince(now) <= TimeInterval(state.leadMinutes * 60)
             let reason: String
-            if snapshot.availableCount <= 0 || card.status != "available" {
-              reason = "unavailable"
-            } else if existing?.phase == .used || existing?.phase == .unavailable {
-              reason = "already_terminal"
-            } else if let expiresAt = card.expiresAt {
-              let remaining = expiresAt.timeIntervalSince(now)
-              if remaining <= 0 {
-                reason = "expired"
-              } else if !scheduledDue, remaining > TimeInterval(state.leadMinutes * 60) {
-                reason = "not_due"
-              } else if selected != nil {
-                reason = "one_card_per_refresh"
-              } else {
-                // A nothingToReset reply definitively ended the old attempt, so a new
-                // logical attempt may have a new UUID. Prepared retries keep their UUID.
-                var record = existing ?? AutoUseRecord(
-                  accountKey: identity.key, creditID: card.id, title: card.title,
-                  expiresAt: expiresAt
-                )
-                if record.phase == .waiting {
-                  record.idempotencyKey = UUID().uuidString
-                  record.phase = .prepared
-                  record.attempts = 0
-                  record.retryAt = nil
-                }
-                record.title = card.title
-                record.expiresAt = expiresAt
-                selected = record
-                reason = "selected"
+            if selected != nil {
+              reason = "one_card_per_refresh"
+            } else if dueTime || dueLead {
+              var record = state.records[key] ?? AutoUseRecord(
+                accountKey: identity.key, creditID: card.id, title: card.title, expiresAt: expiry
+              )
+              // nothingToReset definitively ended the old attempt; prepared/pending retries keep UUIDs.
+              if record.phase == .waiting {
+                record.idempotencyKey = UUID().uuidString
+                record.phase = .prepared
+                record.attempts = 0
+                record.retryAt = nil
               }
+              record.title = card.title
+              record.expiresAt = expiry
+              selected = record
+              trigger = dueTime ? .cardTime(time!.useAt) : .expiryLead(state.leadMinutes)
+              reason = "selected"
             } else {
-              reason = "missing_expiry"
+              reason = "not_due"
             }
             decisions.append([
-              "creditID": card.id, "title": card.title, "status": card.status,
-              "expiresAt": card.expiresAt.map { $0.timeIntervalSince1970 as Any } ?? NSNull(),
-              "triggerAt": card.expiresAt.map {
-                $0.addingTimeInterval(-TimeInterval(state.leadMinutes * 60))
-                  .timeIntervalSince1970 as Any
-              } ?? NSNull(),
-              "remainingSeconds": card.expiresAt.map { $0.timeIntervalSince(now) as Any } ?? NSNull(),
-              "reason": reason,
+              "creditID": card.id, "expiresAt": expiry.timeIntervalSince1970,
+              "useAt": time.map { $0.useAt.timeIntervalSince1970 as Any } ?? NSNull(),
+              "dueCardTime": dueTime, "dueExpiryLead": dueLead, "reason": reason,
             ])
           }
         }
         logEvent("refresh_checked", fields: [
           "fetchedAt": snapshot.fetchedAt.timeIntervalSince1970,
-          "availableCount": snapshot.availableCount, "accountKey": identity.key,
-          "decisions": decisions, "reconciling": pending != nil,
-          "scheduledDue": scheduledDue,
+          "availableCount": snapshot.availableCount, "cardAccountKey": identity.key,
+          "decisions": decisions, "triggerMode": trigger.logName,
         ])
         guard let record = selected else {
-          if scheduledDue {
-            state.scheduledAt = nil
-            state.scheduledLastResult = "定时检查时没有可用重置卡，本次未使用。"
-            scheduleTimer?.invalidate()
-            scheduleTimer = nil
-            try persist()
-            logEvent("schedule_no_card", fields: [
-              "scheduledAt": scheduleTarget?.timeIntervalSince1970 ?? NSNull(),
-              "availableCount": snapshot.availableCount,
-            ])
-            notifyChange()
-            return
-          }
-          state.notice = "等待有有效期的可用重置卡进入提前 \(state.leadMinutes) 分钟范围"
+          state.notice = "等待每张卡的自动使用时间"
           notifyChange()
           return
         }
         if let retryAt = record.retryAt, retryAt > now {
-          if scheduledDue {
-            state.scheduledAt = nil
-            state.scheduledLastResult = "上次使用结果待核对，定时未选择新卡；请等待后续核对完成。"
-            scheduleTimer?.invalidate()
-            scheduleTimer = nil
-            try persist()
-            logEvent("schedule_pending_wait", record: record)
-            notifyChange()
-            return
-          }
-          state.notice = "上次结果待核对，将在后续刷新时沿用原卡和原幂等键重试"
+          state.notice = "等待后续刷新重试；待核对请求继续使用原卡和原幂等键"
           logEvent("retry_deferred", record: record)
           notifyChange()
           return
         }
-        let key = Self.recordKey(accountKey: identity.key, creditID: record.creditID)
-        state.records[key] = record
-        state.notice = pending == nil ? "正在核对即将到期的重置卡" : "正在核对上次使用结果"
-        if scheduledDue {
-          // Disarm inside the same durable write that records the operation, so a crash cannot refire.
-          state.scheduledAt = nil
-          state.scheduledLastResult = pending == nil
-            ? "已于 \(DisplayFormatter.exact(now)) 触发定时使用：\(record.title)"
-            : "定时触发时存在待核对操作，本次未选择新卡；正在核对原提交。"
-          scheduleTimer?.invalidate()
-          scheduleTimer = nil
-          scheduleAttempts = 0
-          scheduleArmedAt = nil
-          scheduleArmedUptime = nil
-          logEvent("schedule_dispatched", record: record, fields: [
-            "scheduledAt": scheduleTarget?.timeIntervalSince1970 ?? NSNull(),
-            "pendingReconciliation": pending != nil,
-          ])
-        }
+        state.records[Self.recordKey(accountKey: identity.key, creditID: record.creditID)] = record
+        state.notice = pending == nil ? "正在核对重置卡：\(record.title)" : "正在核对上次使用结果"
         try persist()
-        let epoch = scheduledDue ? scheduleConfigurationEpoch : leadConfigurationEpoch
-        let lead = state.leadMinutes
+        let epoch = leadConfigurationEpoch
+        let capturedTrigger = trigger
         let token = ResetCreditConsumptionCancellation()
         cancellation = token
         inFlight = true
         logEvent(pending == nil ? "operation_prepared" : "operation_reconcile", record: record,
-          fields: ["triggerMode": scheduledDue ? "scheduled" : "expiry_lead"])
+          fields: ["triggerMode": trigger.logName])
         notifyChange()
         queue.async { [weak self] in
           guard let self else { return }
@@ -445,14 +358,12 @@ final class ResetCreditAutoUseCoordinator {
           do {
             result = .success(try client.consumeResetCredit(
               auth: auth, identity: identity, creditID: record.creditID,
-              idempotencyKey: record.idempotencyKey, leadMinutes: lead,
-              reconciling: pending != nil, scheduledDue: scheduledDue,
-              scheduleTarget: scheduleTarget, cancellation: token,
+              idempotencyKey: record.idempotencyKey, trigger: capturedTrigger,
+              terminalCreditIDs: terminalIDs, cancellation: token,
               authorizeSend: { transmit in
                 try self.authorizeTransmission(
-                  record: record, auth: auth, identity: identity, epoch: epoch,
-                  scheduledDue: scheduledDue, scheduleTarget: scheduleTarget,
-                  transmit: transmit
+                  record: record, auth: auth, identity: identity, trigger: capturedTrigger,
+                  leadEpoch: epoch, transmit: transmit
                 )
               }
             ))
@@ -462,18 +373,6 @@ final class ResetCreditAutoUseCoordinator {
           self.finish(result: result, record: record)
         }
       } catch {
-        if scheduledDue, let target = state.scheduledAt {
-          state.scheduledAt = nil
-          state.scheduledLastResult = "定时使用未能执行：\(error.localizedDescription)"
-          scheduleTimer?.invalidate()
-          scheduleTimer = nil
-          scheduleAttempts = 0
-          scheduleArmedAt = nil
-          scheduleArmedUptime = nil
-          logEvent("schedule_failed", fields: [
-            "scheduledAt": target.timeIntervalSince1970,
-          ], error: error)
-        }
         state.notice = "自动使用已暂停：\(error.localizedDescription)"
         logEvent("refresh_failed", error: error)
         notifyChange()
@@ -481,82 +380,74 @@ final class ResetCreditAutoUseCoordinator {
     }
   }
 
-  /// Rejects late queued sends and cancels active local transport, retaining any pending intent.
+  /// Rejects queued work and cancels the active transport while retaining all ambiguous identities.
   func shutdown() {
     let token: ResetCreditConsumptionCancellation? = synchronized {
       isShuttingDown = true
-      configurationEpoch += 1
       leadConfigurationEpoch += 1
-      scheduleConfigurationEpoch += 1
-      scheduleTimer?.invalidate()
-      scheduleTimer = nil
       logEvent("shutdown")
       return cancellation
     }
     token?.cancel()
   }
 
-  /// Checks only the originating mode's configuration epoch before writing and transmitting.
-  /// The shared lock/account binding still prevents overlap and preserves the exact retry card/key.
+  /// Rechecks current login and only the originating condition under the durable transmission lock.
+  /// A pending reconciliation bypasses time preferences but always retains the original exact card/key.
   private func authorizeTransmission(
-    record: AutoUseRecord, auth: CodexAuth, identity: CodexAutoUseIdentity, epoch: Int,
-    scheduledDue: Bool, scheduleTarget: Date?, transmit: () throws -> Void
+    record: AutoUseRecord, auth: CodexAuth, identity: CodexAutoUseIdentity,
+    trigger: ResetCreditUseTrigger, leadEpoch: Int, transmit: () throws -> Void
   ) throws {
     try synchronized {
       try requireStorage()
-      let currentEpoch = scheduledDue ? scheduleConfigurationEpoch : leadConfigurationEpoch
-      guard (state.enabled || scheduledDue), currentEpoch == epoch,
-        state.accountKey == record.accountKey, state.authPath == identity.authPath
-      else { throw CodexQuotaError.transport("设置已改变，取消尚未提交的自动使用") }
       let current = try CodexAuthStore().autoUseIdentity(for: auth)
-      guard current.key == identity.key, current.authPath == identity.authPath else {
-        try pauseForAccountChange()
-        throw CodexQuotaError.transport("Codex 账号已切换")
-      }
+      guard current.key == identity.key, current.authPath == identity.authPath,
+        cardsAreVerified, cardsIdentity?.key == identity.key,
+        cardsIdentity?.authPath == identity.authPath
+      else { throw CodexQuotaError.transport("Codex 登录已改变，取消尚未提交的自动使用") }
       let key = Self.recordKey(accountKey: record.accountKey, creditID: record.creditID)
       guard var durable = state.records[key],
         durable.idempotencyKey == record.idempotencyKey,
         durable.phase == .prepared || durable.phase == .pending
       else { throw CodexQuotaError.transport("自动使用记录不一致，已停止提交") }
-      if durable.phase != .pending {
-        if scheduledDue {
-          guard durable.expiresAt.timeIntervalSinceNow > 0 else {
-            throw CodexQuotaError.transport("重置卡已过期，已取消定时使用")
-          }
-          guard let scheduleTarget,
-            Date().timeIntervalSince(scheduleTarget) <= Self.scheduleExecutionTolerance
-          else { throw CodexQuotaError.transport("已超过定时执行窗口，已取消提交") }
-        } else {
-          guard durable.expiresAt.timeIntervalSinceNow > 0,
-            durable.expiresAt.timeIntervalSinceNow <= TimeInterval(state.leadMinutes * 60)
-          else { throw CodexQuotaError.transport("重置卡已过期或尚未到使用时间") }
+      let now = Date()
+      switch trigger {
+      case .reconciliation:
+        guard durable.phase == .pending else {
+          throw CodexQuotaError.transport("原提交不再需要核对")
         }
+      case .cardTime(let useAt):
+        guard let time = state.cardUseTimes[key], time.authPath == identity.authPath,
+          time.useAt == useAt, useAt <= now, useAt < durable.expiresAt, durable.expiresAt > now
+        else { throw CodexQuotaError.transport("卡片时间已改变或已过期，取消尚未提交的使用") }
+      case .expiryLead(let minutes):
+        guard state.enabled, leadConfigurationEpoch == leadEpoch,
+          state.accountKey == identity.key, state.authPath == identity.authPath,
+          state.leadMinutes == minutes, durable.expiresAt > now,
+          durable.expiresAt.timeIntervalSince(now) <= TimeInterval(minutes * 60)
+        else { throw CodexQuotaError.transport("到期前设置已改变或卡已过期，取消尚未提交的使用") }
       }
       durable.phase = .pending
       durable.attempts += 1
-      durable.lastAttemptAt = Date()
+      durable.lastAttemptAt = now
       durable.retryAt = nil
       state.records[key] = durable
       try persist()
       logEvent("consume_submitting", record: durable, fields: [
-        "triggerMode": scheduledDue ? "scheduled" : "expiry_lead",
-        "params": ["creditId": durable.creditID, "idempotencyKey": durable.idempotencyKey]
+        "triggerMode": trigger.logName,
+        "params": ["creditId": durable.creditID, "idempotencyKey": durable.idempotencyKey],
       ])
       try transmit()
     }
   }
 
-  /// Records accepted results under the original account even after settings or shutdown changed.
-  /// Transport/unknown-result failures preserve pending identity; only explicit nothingToReset
-  /// permits a later new attempt. Success is saved before any UI/card/usage refresh is requested.
+  /// Persists accepted results under the original account before asking for display-only refreshes.
+  /// Unknown/transport failures retain pending identity; only nothingToReset permits a later new UUID.
   private func finish(result: Result<ResetCreditConsumeOutcome, Error>, record: AutoUseRecord) {
     synchronized {
       inFlight = false
       cancellation = nil
       let key = Self.recordKey(accountKey: record.accountKey, creditID: record.creditID)
-      guard var durable = state.records[key],
-        durable.idempotencyKey == record.idempotencyKey
-      else {
+      guard var durable = state.records[key], durable.idempotencyKey == record.idempotencyKey else {
         storageError = "自动使用结果与本地记录不一致，已暂停"
         logEvent("result_record_mismatch", record: record)
         notifyChange()
@@ -584,7 +475,6 @@ final class ResetCreditAutoUseCoordinator {
         logEvent("consume_result", record: durable, fields: ["outcome": outcome.rawValue])
       case .failure(let error):
         durable.lastError = error.localizedDescription
-        // Backoff is checked only during existing refreshes; it never creates another timer.
         let delay = min(900.0, 60.0 * pow(2.0, Double(min(4, max(0, durable.attempts - 1)))))
         durable.retryAt = Date().addingTimeInterval(delay)
         state.notice = durable.phase == .pending
@@ -593,20 +483,13 @@ final class ResetCreditAutoUseCoordinator {
         if let failure = error as? CodexQuotaError,
           case .rpc(let code, _) = failure, code == -32601 || code == -32602
         {
-          state.enabled = false
-          configurationEpoch += 1
-          leadConfigurationEpoch += 1
-          scheduleConfigurationEpoch += 1
-          state.notice = "当前 Codex 不支持自动使用接口，请更新 CLI 后重新开启；RPC \(code)"
+          protocolError = "当前 Codex 不支持自动使用接口，请更新 CLI 后重新启动；RPC \(code)"
         }
         logEvent("consume_failed", record: durable, error: error)
       }
       state.records[key] = durable
-      do {
-        try persist()
-      } catch {
-        // A successful response remains in memory and in the diagnostics; the on-disk
-        // pending operation keeps its old UUID, so recovery can safely reconcile it.
+      do { try persist() } catch {
+        // On-disk pending retains the original UUID even if accepted-result persistence fails.
         logEvent("result_persist_failed", record: durable, error: error)
         consumed = false
       }
@@ -617,114 +500,66 @@ final class ResetCreditAutoUseCoordinator {
     }
   }
 
-  /// Disables the old binding while retaining its card history and any unresolved operation.
-  /// Called only while holding the coordinator lock.
-  private func pauseForAccountChange() throws {
+  /// Builds a compact sorted list without RPCs; pending cards remain visible even after disappearance.
+  /// Terminal history wins over stale service availability and disables editing during reconciliation.
+  private func makeCardRows(now: Date) -> [ResetCreditUseRow] {
+    guard let identity = cardsIdentity else { return [] }
+    let canEdit = cardsAreVerified && storageError == nil && protocolError == nil
+      && !isShuttingDown && !inFlight
+      && !state.records.values.contains { $0.accountKey == identity.key && $0.phase == .pending }
+    var rows: [ResetCreditUseRow] = []
+    var seen = Set<String>()
+    for card in cachedCards {
+      let key = Self.recordKey(accountKey: identity.key, creditID: card.id)
+      let phase = state.records[key]?.phase
+      guard phase != .used && phase != .unavailable else { continue }
+      let expiry = card.expiresAt.flatMap { $0.timeIntervalSince1970.isFinite ? $0 : nil }
+      guard phase == .pending || (card.status == "available" && (expiry.map { $0 > now } ?? true))
+      else { continue }
+      let time = state.cardUseTimes[key]
+      let status = phase == .pending ? "使用结果待核对"
+        : (!cardsAreVerified ? "等待刷新核对" : (expiry == nil ? "缺少有效期，无法自动使用" : ""))
+      rows.append(ResetCreditUseRow(
+        accountKey: identity.key, creditID: card.id, title: card.title, expiresAt: expiry,
+        useAt: expiry == nil ? nil : time?.useAt,
+        canEdit: canEdit && expiry != nil && time != nil, statusText: status
+      ))
+      seen.insert(card.id)
+    }
+    for record in state.records.values where record.accountKey == identity.key
+      && record.phase == .pending && !seen.contains(record.creditID)
+    {
+      let time = state.cardUseTimes[Self.recordKey(accountKey: identity.key, creditID: record.creditID)]
+      rows.append(ResetCreditUseRow(
+        accountKey: identity.key, creditID: record.creditID, title: record.title,
+        expiresAt: record.expiresAt, useAt: time?.useAt, canEdit: false,
+        statusText: "使用结果待核对"
+      ))
+    }
+    return rows.sorted {
+      ($0.expiresAt ?? .distantFuture, $0.creditID) < ($1.expiresAt ?? .distantFuture, $1.creditID)
+    }
+  }
+
+  /// Pauses only the old global lead opt-in; per-card times remain scoped to their own verified login.
+  private func pauseLeadForAccountChange() throws {
     state.enabled = false
-    configurationEpoch += 1
     leadConfigurationEpoch += 1
-    scheduleConfigurationEpoch += 1
-    state.notice = "Codex 登录账号已切换，请为当前账号重新开启自动使用"
-    if state.scheduledAt != nil {
-      state.scheduledAt = nil
-      state.scheduledLastResult = "Codex 登录账号已切换，定时使用已取消"
-      scheduleTimer?.invalidate()
-      scheduleTimer = nil
-      scheduleArmedAt = nil
-      scheduleArmedUptime = nil
-    }
+    state.notice = "登录账号已切换；新账号的卡按各自时间使用，到期前功能需重新开启"
     try persist()
-    logEvent("account_changed")
-    notifyChange()
+    logEvent("lead_account_changed")
   }
 
-  /// Installs or replaces the single one-shot timer, using the stored target unless retrying.
-  /// Caller runs on the main thread because the timer is added to the main run loop.
-  private func armScheduleTimer(retryDelay: TimeInterval? = nil) {
-    scheduleTimer?.invalidate()
-    scheduleTimer = nil
-    guard storageError == nil, !isShuttingDown, let target = state.scheduledAt else { return }
-    let fireDate: Date
-    if let retryDelay {
-      fireDate = Date().addingTimeInterval(retryDelay)
-    } else if Date() >= target {
-      fireDate = Date().addingTimeInterval(0.05)
-    } else {
-      fireDate = target
-    }
-    if retryDelay == nil {
-      scheduleArmedAt = Date()
-      scheduleArmedUptime = ProcessInfo.processInfo.systemUptime
-    }
-    let timer = Timer(fire: fireDate, interval: 0, repeats: false) { [weak self] _ in
-      self?.scheduleTimerFired()
-    }
-    timer.tolerance = 0
-    RunLoop.main.add(timer, forMode: .common)
-    scheduleTimer = timer
-  }
-
-  /// Starts one due-time refresh only inside the small latency window; later wakes are recorded as misses.
-  /// The monotonic uptime gap detects sleep or a forward clock jump, which is never backfilled.
-  /// The refresh itself is delegated to the store so all App Server work stays on its serial queue.
-  private func scheduleTimerFired() {
-    var callback: (() -> Void)?
-    synchronized {
-      scheduleTimer = nil
-      guard let target = state.scheduledAt, storageError == nil, !isShuttingDown else { return }
-      if let armedAt = scheduleArmedAt, let armedUptime = scheduleArmedUptime {
-        let skipped = Date().timeIntervalSince(armedAt)
-          - (ProcessInfo.processInfo.systemUptime - armedUptime)
-        if skipped > 5 {
-          markScheduleMissed(target: target, reason: "system_sleep")
-          return
-        }
-      }
-      let overdue = Date().timeIntervalSince(target)
-      guard overdue <= Self.scheduleExecutionTolerance else {
-        markScheduleMissed(target: target, reason: "timer_late")
-        return
-      }
-      scheduleAttempts += 1
-      logEvent("schedule_due", fields: [
-        "scheduledAt": target.timeIntervalSince1970,
-        "overdueSeconds": overdue,
-        "attempt": scheduleAttempts,
-      ])
-      notifyChange()
-      callback = onScheduleDue
-    }
-    callback?()
-  }
-
-  /// Clears an unfired target after the execution window, recording why it was skipped.
-  /// Caller holds the state lock; a failed ledger write still leaves inspectable status text.
-  private func markScheduleMissed(target: Date, reason: String, error: Error? = nil) {
-    state.scheduledAt = nil
-    state.scheduledLastResult = "已错过 \(DisplayFormatter.exact(target)) 的定时使用（未补执行）。"
-    scheduleTimer?.invalidate()
-    scheduleTimer = nil
-    scheduleAttempts = 0
-    scheduleArmedAt = nil
-    scheduleArmedUptime = nil
-    do { try persist() } catch {}
-    logEvent("schedule_missed", fields: [
-      "scheduledAt": target.timeIntervalSince1970,
-      "reason": reason,
-    ], error: error)
-    notifyChange()
-  }
-
-  /// Rejects state writes/submissions after ledger failure or application shutdown.
-  /// Result persistence deliberately bypasses this shutdown check to retain accepted outcomes.
+  /// Rejects settings and new submissions after any storage/CLI failure or shutdown.
+  /// Result persistence bypasses this guard so accepted outcomes can still reach durable storage.
   private func requireStorage() throws {
     if let storageError { throw CodexQuotaError.transport(storageError) }
+    if let protocolError { throw CodexQuotaError.transport(protocolError) }
     if isShuttingDown { throw CodexQuotaError.transport("软件正在退出") }
   }
 
   /// Writes a private temporary file, fsyncs it, atomically renames it and fsyncs the directory.
-  /// Pending intent must reach durable storage before any consuming bytes are written.
-  /// Caller holds the coordinator lock; any failure makes further requests unavailable.
+  /// Pending intent must reach durable storage before any consuming bytes are transmitted.
   private func persist() throws {
     let temporary = stateURL.deletingLastPathComponent()
       .appendingPathComponent(".reset-credit-auto-use-\(UUID().uuidString).tmp")
@@ -753,28 +588,26 @@ final class ResetCreditAutoUseCoordinator {
     }
   }
 
-  /// Serializes any state access; nested synchronized calls are intentionally avoided.
+  /// Serializes ledger access; callers deliberately avoid nesting synchronized operations.
   private func synchronized<T>(_ body: () throws -> T) rethrows -> T {
     lock.lock()
     defer { lock.unlock() }
     return try body()
   }
 
-  /// Provides stable per-user/workspace/card deduplication without including mutable expiry time.
+  /// Stable user/workspace/card key shared by saved times and consumption history.
   private static func recordKey(accountKey: String, creditID: String) -> String {
     "\(accountKey):\(creditID)"
   }
 
-  /// Enqueues UI feedback on the main queue after the current ledger operation unlocks.
+  /// Enqueues main-thread UI feedback after the current ledger operation releases its lock.
   private func notifyChange() {
     DispatchQueue.main.async { [weak self] in self?.onChange?() }
   }
 
-  /// Records decision/configuration/operation evidence as complete JSON without login credentials.
-  /// All call sites hold the state lock except initialization before the object is published.
+  /// Writes complete decision/configuration JSON without login tokens; callers hold the state lock.
   private func logEvent(
-    _ event: String, record: AutoUseRecord? = nil, fields: [String: Any] = [:],
-    error: Error? = nil
+    _ event: String, record: AutoUseRecord? = nil, fields: [String: Any] = [:], error: Error? = nil
   ) {
     var payload = fields
     payload["event"] = event
@@ -783,13 +616,10 @@ final class ResetCreditAutoUseCoordinator {
     payload["accountKey"] = state.accountKey.map { $0 as Any } ?? NSNull()
     payload["authPath"] = state.authPath.map { $0 as Any } ?? NSNull()
     payload["recordCount"] = state.records.count
-    payload["configurationEpoch"] = configurationEpoch
+    payload["cardTimeCount"] = state.cardUseTimes.count
     payload["leadConfigurationEpoch"] = leadConfigurationEpoch
-    payload["scheduleConfigurationEpoch"] = scheduleConfigurationEpoch
     payload["inFlight"] = inFlight
     payload["notice"] = state.notice
-    payload["scheduledAt"] = state.scheduledAt.map { $0.timeIntervalSince1970 as Any } ?? NSNull()
-    payload["scheduleAttempts"] = scheduleAttempts
     payload["error"] = error.map { $0.localizedDescription as Any } ?? NSNull()
     if let record, let data = try? JSONEncoder().encode(record),
       let object = try? JSONSerialization.jsonObject(with: data)
@@ -804,40 +634,37 @@ final class ResetCreditAutoUseCoordinator {
   }
 }
 
-/// Atomic versioned ledger; terminal cards are retained across restarts, edits and account switches.
+/// Versioned atomic ledger retaining per-card times and exact original operations across upgrades.
 private struct AutoUseState: Codable {
-  /// Schema version is explicitly validated before any automatic operation.
-  /// Version 1 predates the fixed-time trigger; version 2 adds its two optional fields.
-  var version = 2
-  /// New installations and existing installations without this ledger default to off.
+  /// Version four replaces the legacy shared card selector/global time with per-card entries.
+  var version = 4
+  /// Optional global expiry-lead preference; per-card absolute times do not depend on this switch.
   var enabled = false
-  /// Positive whole-minute threshold; the initial value is ten minutes before expiry.
+  /// Positive whole-minute lead for the current earliest-expiring card, initially ten minutes.
   var leadMinutes = 10
-  /// Stable user/workspace digest, shared by history even when the user moves the auth file.
+  /// Stable account digest to which the optional global lead switch is bound.
   var accountKey: String?
-  /// Canonical authentication path for this opt-in; changing it requires explicitly enabling again.
+  /// Canonical authentication path for the global lead opt-in.
   var authPath: String?
-  /// Records keyed by stable account/card identity; unresolved operations retain their old UUID.
+  /// Exact original operation history keyed by stable account/card identity.
   var records: [String: AutoUseRecord] = [:]
-  /// Current setting/operation feedback without retaining historical conversation text.
-  var notice = "可按分钟设置到期前的自动使用时间"
-  /// Latest confirmed card result shown independently of the next refresh's waiting state.
+  /// Always-enabled absolute times keyed by the same stable account/card identity.
+  var cardUseTimes: [String: ResetCreditUseTime] = [:]
+  /// Latest user-facing feedback, without historical conversation records.
+  var notice = "每张卡默认在到期前 30 分钟自动使用"
+  /// Latest confirmed card result, retained independently of waiting feedback.
   var lastCompletion: String?
-  /// Armed one-shot wall-clock target; nil means no fixed-time use is scheduled.
-  var scheduledAt: Date?
-  /// Latest fixed-time result, miss or cancellation shown in the settings section.
-  var scheduledLastResult: String?
 
-  /// Memberwise construction remains available for new installations.
+  /// Default initializer starts with no known cards; successful queries populate their defaults.
   init() {}
 
-  /// Decodes version 1 files without the fixed-time fields so upgrades do not discard history.
+  /// Legacy keys are decoded only for migration and are never written into version four.
   private enum CodingKeys: String, CodingKey {
-    case version, enabled, leadMinutes, accountKey, authPath, records, notice, lastCompletion
-    case scheduledAt, scheduledLastResult
+    case version, enabled, leadMinutes, accountKey, authPath, records, cardUseTimes, notice, lastCompletion
+    case scheduledAt, selectedCard
   }
 
-  /// Reads every optional field defensively; unknown or older payloads keep their defaults.
+  /// Preserves all prior operations and migrates a legacy exact time only for a known bound card.
   init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
@@ -845,53 +672,92 @@ private struct AutoUseState: Codable {
     leadMinutes = try container.decodeIfPresent(Int.self, forKey: .leadMinutes) ?? 10
     accountKey = try container.decodeIfPresent(String.self, forKey: .accountKey)
     authPath = try container.decodeIfPresent(String.self, forKey: .authPath)
-    records =
-      try container.decodeIfPresent([String: AutoUseRecord].self, forKey: .records) ?? [:]
-    notice =
-      try container.decodeIfPresent(String.self, forKey: .notice)
-      ?? "可按分钟设置到期前的自动使用时间"
+    records = try container.decodeIfPresent([String: AutoUseRecord].self, forKey: .records) ?? [:]
+    cardUseTimes = try container.decodeIfPresent([String: ResetCreditUseTime].self, forKey: .cardUseTimes) ?? [:]
+    notice = try container.decodeIfPresent(String.self, forKey: .notice) ?? notice
     lastCompletion = try container.decodeIfPresent(String.self, forKey: .lastCompletion)
-    scheduledAt = try container.decodeIfPresent(Date.self, forKey: .scheduledAt)
-    scheduledLastResult = try container.decodeIfPresent(String.self, forKey: .scheduledLastResult)
+    if version < 4,
+      let target = try container.decodeIfPresent(Date.self, forKey: .scheduledAt),
+      let choice = try container.decodeIfPresent(LegacyCreditSelection.self, forKey: .selectedCard),
+      !choice.requiresReselection, choice.accountKey == accountKey, choice.authPath == authPath,
+      !choice.accountKey.isEmpty, !choice.creditID.isEmpty, !choice.authPath.isEmpty,
+      target.timeIntervalSince1970.isFinite, choice.expiresAt.timeIntervalSince1970.isFinite,
+      target < choice.expiresAt
+    {
+      cardUseTimes["\(choice.accountKey):\(choice.creditID)"] = ResetCreditUseTime(
+        creditID: choice.creditID, title: choice.title, expiresAt: choice.expiresAt,
+        accountKey: choice.accountKey, authPath: choice.authPath, useAt: target, isCustom: true
+      )
+    }
+  }
+
+  /// Writes only the current schema, preserving preferences/history without obsolete UI settings.
+  func encode(to encoder: Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    try container.encode(version, forKey: .version)
+    try container.encode(enabled, forKey: .enabled)
+    try container.encode(leadMinutes, forKey: .leadMinutes)
+    try container.encodeIfPresent(accountKey, forKey: .accountKey)
+    try container.encodeIfPresent(authPath, forKey: .authPath)
+    try container.encode(records, forKey: .records)
+    try container.encode(cardUseTimes, forKey: .cardUseTimes)
+    try container.encode(notice, forKey: .notice)
+    try container.encodeIfPresent(lastCompletion, forKey: .lastCompletion)
   }
 }
 
-/// Consumption state distinguishes definite non-submission from uncertain remote completion.
+/// Decode-only version-three choice used to identify which legacy card owned a saved exact time.
+private struct LegacyCreditSelection: Decodable {
+  /// Original exact backend ID; an unbound legacy global target is never assigned to another card.
+  let creditID: String
+  /// Saved title retained until the next successful query supplies current metadata.
+  let title: String
+  /// Previously verified expiry used to validate the migrated use time.
+  let expiresAt: Date
+  /// Original stable user/workspace digest.
+  let accountKey: String
+  /// Original canonical login-file path.
+  let authPath: String
+  /// Paused legacy selections cannot grant a new account permission to consume their card.
+  let requiresReselection: Bool
+}
+
+/// Distinguishes definite non-submission from uncertain completion and terminal card outcomes.
 private enum AutoUsePhase: String, Codable {
-  /// Intent saved but no consuming request has crossed the durable transmission boundary.
+  /// Saved intent whose consuming bytes have not crossed the durable transmission boundary.
   case prepared
-  /// Request may have reached the backend; only the original UUID may be retried.
+  /// Request may have reached the backend; only its original UUID may be retried.
   case pending
-  /// Explicit nothingToReset confirmed no consumption; a later attempt may use a new UUID.
+  /// Explicit nothingToReset ended this attempt without using the card.
   case waiting
-  /// Confirmed reset/alreadyRedeemed; permanently suppress this account/card identity.
+  /// Confirmed reset/alreadyRedeemed permanently suppresses this account/card ID.
   case used
-  /// Explicit noCredit; suppress further attempts on this account/card identity.
+  /// Explicit noCredit permanently suppresses further submissions for this account/card ID.
   case unavailable
 }
 
-/// One durable card operation, including the exact identity required for idempotent reconciliation.
+/// Durable card operation preserving every field from previous versions for exact reconciliation.
 private struct AutoUseRecord: Codable {
-  /// Stable user/workspace digest captured at selection, never reassigned on account changes.
+  /// Original stable account digest, never reassigned on a login change.
   let accountKey: String
-  /// Exact backend card ID; every consuming request explicitly supplies this value.
+  /// Exact backend ID supplied on every initial or reconciliation submission.
   let creditID: String
-  /// Last observed title displayed in settings after successful consumption.
+  /// Last verified service title.
   var title: String
-  /// Last observed expiry; missing-expiry cards are never selected for a new operation.
+  /// Last verified finite expiry; new operations never select a missing-expiry card.
   var expiresAt: Date
-  /// UUID reused after every ambiguous error, shutdown or restart of this logical operation.
+  /// Original logical operation UUID retained after ambiguous errors, shutdown and restart.
   var idempotencyKey = UUID().uuidString
-  /// Last durable operation phase; pending is written before the request reaches the pipe.
+  /// Pending is durably written before consuming bytes are sent.
   var phase: AutoUsePhase = .prepared
-  /// Number of actual transmission attempts, used only for bounded refresh-driven backoff.
+  /// Count of actual transmission attempts for bounded refresh-driven backoff.
   var attempts = 0
-  /// Last transmission time for log correlation and later user-driven diagnosis.
+  /// Last transmission instant for diagnostic correlation.
   var lastAttemptAt: Date?
-  /// Earliest retry time, observed only by the existing successful-credit-refresh path.
+  /// Earliest retry instant checked only by successful existing credit queries.
   var retryAt: Date?
-  /// Latest recognized backend outcome, preserved separately from local refresh failures.
+  /// Most recent recognized backend outcome.
   var lastOutcome: String?
-  /// Latest transport/protocol failure, retained for diagnosis without credentials.
+  /// Latest transport/protocol failure without credentials.
   var lastError: String?
 }

@@ -140,6 +140,68 @@ struct ResetCredit {
   let expiresAt: Date?
 }
 
+/// Persisted use time for one verified account/card; every newly discovered card gets a default.
+/// Keeping this separate from consumption history preserves edited times across refreshes/restarts.
+struct ResetCreditUseTime: Codable {
+  /// Exact backend card ID, paired with accountKey as the ledger key.
+  let creditID: String
+
+  /// Latest service title retained for pending cards that disappear from a later snapshot.
+  var title: String
+
+  /// Latest finite service expiry; default use times follow changes to this expiry.
+  var expiresAt: Date
+
+  /// Stable user/workspace digest prevents another login from inheriting this card's settings.
+  let accountKey: String
+
+  /// Canonical login-file path verified by the successful query that last exposed this card.
+  var authPath: String
+
+  /// Absolute trigger instant; checked only on the existing successful credit-refresh cadence.
+  var useAt: Date
+
+  /// Distinguishes a saved user edit from the automatically maintained expiry-minus-30-minute time.
+  var isCustom = false
+}
+
+/// Native settings row bound to an account/card, including retained uncertain submissions.
+struct ResetCreditUseRow {
+  /// Stable identity used to retain the same native date control across asynchronous refreshes.
+  let accountKey: String
+  /// Exact backend ID passed back when the user edits this row's time.
+  let creditID: String
+  /// Service title displayed beside the ID suffix.
+  let title: String
+  /// Optional expiry; rows lacking one stay visible without an editable automatic time.
+  let expiresAt: Date?
+  /// Persisted absolute automatic time; nil means the service supplied no valid expiry.
+  let useAt: Date?
+  /// False while identity is unverified, storage is unavailable or a submission needs reconciliation.
+  let canEdit: Bool
+  /// Short feedback for pending, missing-expiry or temporarily stale data.
+  let statusText: String
+}
+
+/// Captures the condition authorizing a single card submission after a successful refresh.
+enum ResetCreditUseTrigger {
+  /// Global lead mode may use only the current earliest-expiring eligible card.
+  case expiryLead(Int)
+  /// This card's always-enabled saved absolute use time, independent of the global lead switch.
+  case cardTime(Date)
+  /// An uncertain prior request must reuse its original card/key without selecting a new card.
+  case reconciliation
+
+  /// Stable diagnostic label kept with complete RPC request/response logs.
+  var logName: String {
+    switch self {
+    case .expiryLead: return "expiry_lead"
+    case .cardTime: return "card_time"
+    case .reconciliation: return "reconciliation"
+    }
+  }
+}
+
 /// Successful App Server snapshot for reset-credit availability.
 struct ResetCreditsSnapshot {
   /// Authoritative available count, which may exceed the number of detail rows.
