@@ -26,7 +26,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
   /// Long-lived coordinator for network, App Server, timers, and retained snapshots.
   private let store = CodexQuotaStore()
 
-  /// Popover controller retained so store updates can render even while hidden.
+  /// Retained popover controller that renders live updates only while visible and synchronizes
+  /// the store's latest data immediately before the next presentation.
   private lazy var popoverController: PopoverViewController = {
     let controller = PopoverViewController(store: store)
     controller.onOpenSettings = { [weak self] in
@@ -114,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     stopPopoverDismissalMonitor()
   }
 
-  /// Updates the always-visible status image and any loaded popover fields from one store snapshot.
+  /// Updates the always-visible status image and delegates popover refreshes to its visibility gate.
   private func render() {
     renderStatusItem()
     popoverController.render()
@@ -239,7 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     if popover.isShown {
       popover.performClose(nil)
     } else {
-      popoverController.render()
+      popoverController.prepareForPresentation()
       popover.contentSize = popoverController.preferredContentSize
       popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
       startPopoverDismissalMonitor()

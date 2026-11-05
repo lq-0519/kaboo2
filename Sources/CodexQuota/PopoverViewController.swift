@@ -56,6 +56,11 @@ final class PopoverViewController: NSViewController {
   /// Timer that updates relative labels only while the popover is open.
   private var countdownTimer: Timer?
 
+  /// Tracks presentation from will-appear through will-disappear so background store updates
+  /// never rebuild hidden card rows, update hidden controls, or measure the hidden layout.
+  /// The shared store retains fresh data; prepareForPresentation reads it before each opening.
+  private var isPopoverVisible = false
+
   /// Callback supplied by the app delegate to open the retained settings window.
   var onOpenSettings: (() -> Void)?
 
@@ -187,8 +192,13 @@ final class PopoverViewController: NSViewController {
       quotaDivider.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       footerDivider.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
     ])
+  }
 
-    render()
+  /// Enables live store rendering when AppKit begins presenting the prepared popover.
+  /// Its initial content and size have already been synchronized before NSPopover.show.
+  override func viewWillAppear() {
+    super.viewWillAppear()
+    isPopoverVisible = true
   }
 
   /// Starts the local countdown only after AppKit makes the popover visible.
@@ -196,21 +206,38 @@ final class PopoverViewController: NSViewController {
     super.viewDidAppear()
     store.refreshCreditsIfStale()
     startCountdownTimer()
-    render()
   }
 
-  /// Stops all one-second UI wakeups as soon as the popover disappears.
-  override func viewDidDisappear() {
-    super.viewDidDisappear()
+  /// Stops live rendering, countdown wakeups, and the activity animation as closing begins.
+  /// Network refreshes continue in the shared store and are displayed on the next opening.
+  override func viewWillDisappear() {
+    isPopoverVisible = false
     countdownTimer?.invalidate()
     countdownTimer = nil
+    progressIndicator.stopAnimation(nil)
+    super.viewWillDisappear()
   }
 
-  /// Refreshes all visible fields from retained store snapshots.
+  /// Loads the native view once and synchronizes the latest retained data before presentation.
+  /// This explicit opening path may render while hidden so NSPopover receives the current
+  /// content size before it is shown, without waking the hidden UI for background refreshes.
+  func prepareForPresentation() {
+    _ = view
+    renderSnapshot()
+  }
+
+  /// Applies a store or clock update only while the popover is being presented.
+  /// Hidden updates need no separate snapshot: the shared store remains the source of truth.
   func render() {
-    guard isViewLoaded else {
+    guard isPopoverVisible, isViewLoaded else {
       return
     }
+    renderSnapshot()
+  }
+
+  /// Updates quota fields, card rows, refresh feedback, and preferred size in one pass.
+  /// Called only by a visible refresh or the explicit preparation immediately before opening.
+  private func renderSnapshot() {
     sevenDayView.update(
       window: store.quotaSnapshot?.sevenDay,
       fallbackKind: .sevenDay
