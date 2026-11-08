@@ -10,6 +10,11 @@ APP_BUNDLE="$ROOT_DIR/dist/$APP_NAME"
 CONTENTS_DIR="$APP_BUNDLE/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 ARCHITECTURE="$(uname -m)"
+# Allow each Mac to keep its own stable signing identity outside version control.
+LOCAL_IDENTITY_FILE="$ROOT_DIR/.signing-identity.local"
+if [[ -z "${SIGNING_IDENTITY:-}" && -f "$LOCAL_IDENTITY_FILE" ]]; then
+  SIGNING_IDENTITY="$(< "$LOCAL_IDENTITY_FILE")"
+fi
 SIGNING_IDENTITY="${SIGNING_IDENTITY:-InputHoldSwitcher Local Code Signing}"
 
 # Keep compiler intermediates outside the repository and replace only this app's output bundle.

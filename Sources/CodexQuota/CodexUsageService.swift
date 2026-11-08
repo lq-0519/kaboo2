@@ -18,7 +18,7 @@ final class CodexUsageService {
     configuration.timeoutIntervalForRequest = 8
     configuration.timeoutIntervalForResource = 10
     configuration.httpMaximumConnectionsPerHost = 2
-    configuration.connectionProxyDictionary = [:]
+    // Leave proxy settings unset so URLSession follows the macOS system proxy.
     session = URLSession(configuration: configuration)
   }
 
