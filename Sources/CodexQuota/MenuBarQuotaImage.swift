@@ -4,13 +4,16 @@ import CoreText
 /// Builds the complete two-row menu-bar presentation as one image so AppKit can apply
 /// native status-item highlighting and inactive-state treatment to the whole surface.
 enum MenuBarQuotaImage {
-  /// Produces two centered columns with independently selected percentage or pie primary rows.
+  /// Produces centered columns with independently selected percentage or pie primary rows.
   /// Percentages follow the configured font size, while pies keep a thirteen-point canvas and time rows use
   /// the battery monitor's nine-point secondary hierarchy inside a stable 22-point canvas.
   /// Time labels come from the caller's shared presentation so image, cache and tooltip agree.
+  /// - Parameter showsFiveHourQuota: Preserves placeholders before the first successful fetch,
+  ///   then omits the five-hour column and its spacing when the snapshot lacks that window.
   static func make(
     fiveHourWindow: QuotaWindow?,
     sevenDayWindow: QuotaWindow?,
+    showsFiveHourQuota: Bool,
     fiveHourStyle: MenuBarQuotaDisplayStyle,
     sevenDayStyle: MenuBarQuotaDisplayStyle,
     fiveHourTime: String,
@@ -74,19 +77,21 @@ enum MenuBarQuotaImage {
     )
 
     let pieCanvasSize: CGFloat = 13
-    let groupSpacing: CGFloat = 4
+    let groupSpacing: CGFloat = showsFiveHourQuota ? 4 : 0
     let fiveHourPrimaryWidth =
       fiveHourStyle == .percentage
       ? max(widestPercentageBounds.width, fiveHourTitleBounds.width) : pieCanvasSize
     let sevenDayPrimaryWidth =
       sevenDayStyle == .percentage
       ? max(widestPercentageBounds.width, sevenDayTitleBounds.width) : pieCanvasSize
-    let fiveHourWidth = ceil(
-      max(
-        fiveHourPrimaryWidth,
-        max(fiveHourTimeWidth, fiveHourTimeBounds.width)
-      )
-    )
+    let fiveHourWidth =
+      showsFiveHourQuota
+      ? ceil(
+        max(
+          fiveHourPrimaryWidth,
+          max(fiveHourTimeWidth, fiveHourTimeBounds.width)
+        )
+      ) : 0
     let sevenDayWidth = ceil(
       max(
         sevenDayPrimaryWidth,
@@ -107,39 +112,41 @@ enum MenuBarQuotaImage {
       defer { context.restoreGState() }
       context.textMatrix = .identity
 
-      switch fiveHourStyle {
-      case .percentage:
+      if showsFiveHourQuota {
+        switch fiveHourStyle {
+        case .percentage:
+          draw(
+            fiveHourTitle,
+            bounds: fiveHourTitleBounds,
+            origin: 0,
+            width: fiveHourWidth,
+            regionMinY: 9,
+            regionHeight: 13,
+            in: context
+          )
+        case .pie:
+          drawPie(
+            remainingPercent: fiveHourWindow?.remainingPercent,
+            color: fiveHourColor ?? neutralColor,
+            rect: CGRect(
+              x: (fiveHourWidth - pieCanvasSize) / 2,
+              y: 9,
+              width: pieCanvasSize,
+              height: pieCanvasSize
+            ),
+            in: context
+          )
+        }
         draw(
-          fiveHourTitle,
-          bounds: fiveHourTitleBounds,
+          fiveHourTimeLine,
+          bounds: fiveHourTimeBounds,
           origin: 0,
           width: fiveHourWidth,
-          regionMinY: 9,
-          regionHeight: 13,
-          in: context
-        )
-      case .pie:
-        drawPie(
-          remainingPercent: fiveHourWindow?.remainingPercent,
-          color: fiveHourColor ?? neutralColor,
-          rect: CGRect(
-            x: (fiveHourWidth - pieCanvasSize) / 2,
-            y: 9,
-            width: pieCanvasSize,
-            height: pieCanvasSize
-          ),
+          regionMinY: 0,
+          regionHeight: 9,
           in: context
         )
       }
-      draw(
-        fiveHourTimeLine,
-        bounds: fiveHourTimeBounds,
-        origin: 0,
-        width: fiveHourWidth,
-        regionMinY: 0,
-        regionHeight: 9,
-        in: context
-      )
       switch sevenDayStyle {
       case .percentage:
         draw(

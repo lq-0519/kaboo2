@@ -2,7 +2,7 @@ import AppKit
 
 /// Owns the status item, transient popover, and application-wide data store.
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
-  /// Variable-width status item containing both quota values and the selected reset time presentation.
+  /// Variable-width status item containing available quota values and their selected reset times.
   private var statusItem: NSStatusItem!
 
   /// Observes effective menu-bar appearance so non-template status colors retain native contrast.
@@ -121,13 +121,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     popoverController.render()
   }
 
-  /// Renders the two quota columns for one instant and skips image work when nothing visible changed.
+  /// Renders available quota columns for one instant and skips image work when nothing visible changed.
+  /// A successful snapshot without a five-hour window removes that column and its descriptive text;
+  /// before the first success, placeholders keep the status item visible and clickable.
   private func renderStatusItem(now: Date = Date()) {
     guard let button = statusItem.button else {
       return
     }
     let fiveHourWindow = store.quotaSnapshot?.fiveHour
     let sevenDayWindow = store.quotaSnapshot?.sevenDay
+    let showsFiveHourQuota = store.quotaSnapshot == nil || fiveHourWindow != nil
     let fiveHourTitle = DisplayFormatter.percent(fiveHourWindow?.remainingPercent)
     let sevenDayTitle = DisplayFormatter.percent(sevenDayWindow?.remainingPercent)
     let fiveHourStyle = store.menuBarQuotaStyle(for: .fiveHour)
@@ -148,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
       button.effectiveAppearance.name.rawValue,
       String(store.menuBarFontSize),
       String(dynamicColorsEnabled),
+      String(showsFiveHourQuota),
       timeMode.rawValue,
       fiveHourStyle.rawValue,
       sevenDayStyle.rawValue,
@@ -165,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         image = MenuBarQuotaImage.make(
           fiveHourWindow: fiveHourWindow,
           sevenDayWindow: sevenDayWindow,
+          showsFiveHourQuota: showsFiveHourQuota,
           fiveHourStyle: fiveHourStyle,
           sevenDayStyle: sevenDayStyle,
           fiveHourTime: fiveHourTime,
@@ -188,11 +193,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
       for: sevenDayWindow, mode: timeMode, now: now
     )
     button.toolTip =
-      "5 小时剩余 \(fiveHourTitle)，\(fiveHourDescription)\n"
+      (showsFiveHourQuota ? "5 小时剩余 \(fiveHourTitle)，\(fiveHourDescription)\n" : "")
       + "7 天剩余 \(sevenDayTitle)，\(sevenDayDescription)"
     button.setAccessibilityLabel("Codex 额度")
     button.setAccessibilityValue(
-      "5 小时额度剩余 \(fiveHourTitle)，\(fiveHourDescription)；"
+      (showsFiveHourQuota ? "5 小时额度剩余 \(fiveHourTitle)，\(fiveHourDescription)；" : "")
         + "7 天额度剩余 \(sevenDayTitle)，\(sevenDayDescription)"
     )
   }
