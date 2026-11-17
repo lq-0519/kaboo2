@@ -120,8 +120,26 @@ struct QuotaSnapshot {
   /// Five-hour window, if the upstream response supplied it.
   let fiveHour: QuotaWindow?
 
+  /// 与额度窗口来自同一次成功查询的套餐标识；服务未提供时保留为空，避免仅凭窗口缺失猜测套餐。
+  let planType: String?
+
   /// Local completion time used to show freshness without another request.
   let fetchedAt: Date
+
+  /// 将已识别的服务套餐标识转换为界面名称，其中 pro 和 prolite 均展示为 Pro。
+  /// 未提供或尚未识别的标识不生成名称，由界面显示通用套餐提示。
+  var planDisplayName: String? {
+    switch planType?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+    case "pro", "prolite": return "Pro"
+    case "plus": return "Plus"
+    case "free": return "Free"
+    case "team": return "Team"
+    case "business": return "Business"
+    case "enterprise": return "Enterprise"
+    case "edu": return "Edu"
+    default: return nil
+    }
+  }
 }
 
 /// Displayable details for one Codex rate-limit reset credit.

@@ -83,7 +83,7 @@ final class CodexUsageService {
     }.resume()
   }
 
-  /// Converts the upstream transport slots into semantic five-hour and seven-day windows.
+  /// 按服务返回的窗口时长识别五小时和七天额度，并保留同次响应中的套餐标识供面板展示。
   private static func parse(data: Data) throws -> QuotaSnapshot {
     guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
       let rateLimit = root["rate_limit"] as? [String: Any]
@@ -113,7 +113,12 @@ final class CodexUsageService {
     guard fiveHour != nil || sevenDay != nil else {
       throw CodexQuotaError.invalidResponse
     }
-    return QuotaSnapshot(sevenDay: sevenDay, fiveHour: fiveHour, fetchedAt: Date())
+    return QuotaSnapshot(
+      sevenDay: sevenDay,
+      fiveHour: fiveHour,
+      planType: root["plan_type"] as? String,
+      fetchedAt: Date()
+    )
   }
 
   /// Parses one rate-limit window and identifies its meaning from the reported duration.

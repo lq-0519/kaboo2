@@ -8,6 +8,12 @@ final class PopoverViewController: NSViewController {
   /// Five-hour quota view placed first to match the status-item order.
   private let fiveHourView = QuotaRowView()
 
+  /// 成功查询但未返回五小时额度时，替代额度行展示套餐名称和缺失说明；加载中仍使用原占位状态。
+  private let planSummaryView = NSStackView()
+
+  /// 展示与当前额度快照匹配的套餐名称；未知套餐只显示通用标题，不将缺少五小时额度等同于 Pro。
+  private let planLabel = NSTextField(labelWithString: "当前套餐")
+
   /// Seven-day quota view placed second to match the status-item order.
   private let sevenDayView = QuotaRowView()
 
@@ -122,6 +128,18 @@ final class PopoverViewController: NSViewController {
     quotaErrorLabel.lineBreakMode = .byWordWrapping
     quotaErrorLabel.isHidden = true
 
+    planLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+    planLabel.textColor = .labelColor
+    let noFiveHourLabel = NSTextField(labelWithString: "无 5 小时额度")
+    noFiveHourLabel.font = .systemFont(ofSize: 12)
+    noFiveHourLabel.textColor = .secondaryLabelColor
+    planSummaryView.orientation = .vertical
+    planSummaryView.alignment = .leading
+    planSummaryView.spacing = 6
+    planSummaryView.addArrangedSubview(planLabel)
+    planSummaryView.addArrangedSubview(noFiveHourLabel)
+    planSummaryView.isHidden = true
+
     let creditsTitle = NSTextField(labelWithString: "重置卡")
     creditsTitle.font = .systemFont(ofSize: 13, weight: .semibold)
     creditsCountLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
@@ -152,6 +170,7 @@ final class PopoverViewController: NSViewController {
     for arrangedView in [
       header,
       headerDivider,
+      planSummaryView,
       fiveHourView,
       fiveHourDivider,
       sevenDayView,
@@ -167,6 +186,7 @@ final class PopoverViewController: NSViewController {
     contentStack.orientation = .vertical
     contentStack.alignment = .leading
     contentStack.spacing = 12
+    contentStack.detachesHiddenViews = true
     contentStack.translatesAutoresizingMaskIntoConstraints = false
     document.addSubview(contentStack)
 
@@ -181,6 +201,7 @@ final class PopoverViewController: NSViewController {
       contentStack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -18),
       contentStack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -16),
       header.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+      planSummaryView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       fiveHourView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       sevenDayView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       quotaErrorLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
@@ -235,15 +256,21 @@ final class PopoverViewController: NSViewController {
     renderSnapshot()
   }
 
-  /// Updates quota fields, card rows, refresh feedback, and preferred size in one pass.
-  /// Called only by a visible refresh or the explicit preparation immediately before opening.
+  /// 在面板可见更新或打开前准备时，同步额度、套餐说明、重置卡、刷新状态和内容高度。
+  /// 仅在已有成功快照且缺少五小时窗口时显示套餐说明，避免将加载中或首次查询失败误判为无额度。
   private func renderSnapshot() {
+    let snapshot = store.quotaSnapshot
+    let showsPlanSummary = snapshot != nil && snapshot?.fiveHour == nil
+    fiveHourView.isHidden = showsPlanSummary
+    planSummaryView.isHidden = !showsPlanSummary
+    planLabel.stringValue = snapshot?.planDisplayName.map { "当前套餐：\($0)" } ?? "当前套餐"
+
     sevenDayView.update(
-      window: store.quotaSnapshot?.sevenDay,
+      window: snapshot?.sevenDay,
       fallbackKind: .sevenDay
     )
     fiveHourView.update(
-      window: store.quotaSnapshot?.fiveHour,
+      window: snapshot?.fiveHour,
       fallbackKind: .fiveHour
     )
 
