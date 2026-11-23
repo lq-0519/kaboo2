@@ -47,6 +47,12 @@ final class CodexQuotaStore {
   /// Reusable HTTPS service for five-hour and seven-day quota windows.
   private let usageService = CodexUsageService()
 
+  /// 由现有额度刷新驱动的本地趋势记录；弹窗只读取当前账号的内存数据。
+  private let dailyQuotaUsageHistory = DailyQuotaUsageHistory()
+
+  /// 最近一次额度查询所用的用户和工作区摘要，退出登录或无法识别用户时清空。
+  private var dailyQuotaUsageAccountKey: String?
+
   /// One-shot App Server client used only on the reset-credit schedule.
   private let appServerClient = CodexAppServerClient()
 
@@ -266,6 +272,17 @@ final class CodexQuotaStore {
     refreshCredits()
   }
 
+  /// 打开弹窗前核对本机登录身份，切换账号后立即显示对应历史，无需额外发起额度请求。
+  func refreshDailyQuotaUsageAccount() {
+    let auth = try? authStore.load(includeQuotaHistoryIdentity: true)
+    dailyQuotaUsageAccountKey = auth?.quotaHistoryAccountKey
+  }
+
+  /// 按本机日期返回当前账号最近七天的额度消耗，供弹窗区分无记录和已观测到的零消耗。
+  func recentDailyQuotaUsage(now: Date = Date()) -> [DailyQuotaUsageDay] {
+    dailyQuotaUsageHistory.recentDays(accountKey: dailyQuotaUsageAccountKey, now: now)
+  }
+
   /// Refreshes reset credits on popover open only when the configured interval has elapsed.
   func refreshCreditsIfStale(now: Date = Date()) {
     guard let fetchedAt = creditsSnapshot?.fetchedAt else {
@@ -422,6 +439,7 @@ final class CodexQuotaStore {
     isShuttingDown = true
     usageTimer?.invalidate()
     creditsTimer?.invalidate()
+    dailyQuotaUsageHistory.flush()
     creditAutoUseCoordinator.shutdown()
     greetingCoordinator.shutdown()
   }
@@ -433,13 +451,15 @@ final class CodexQuotaStore {
     }
     let auth: CodexAuth
     do {
-      auth = try authStore.load()
+      auth = try authStore.load(includeQuotaHistoryIdentity: true)
     } catch {
+      dailyQuotaUsageAccountKey = nil
       quotaError = message(for: error, fallback: "额度查询失败")
       onChange?()
       return
     }
 
+    dailyQuotaUsageAccountKey = auth.quotaHistoryAccountKey
     usageRefreshInFlight = true
     onChange?()
     usageService.fetch(auth: auth) { [weak self] result in
@@ -451,6 +471,14 @@ final class CodexQuotaStore {
         guard !self.isShuttingDown else { return }
         switch result {
         case .success(let snapshot):
+          if let window = snapshot.sevenDay, let accountKey = auth.quotaHistoryAccountKey {
+            self.dailyQuotaUsageHistory.observe(
+              window: window,
+              planType: snapshot.planType,
+              accountKey: accountKey,
+              fetchedAt: snapshot.fetchedAt
+            )
+          }
           self.notificationCoordinator.observe(
             snapshot: snapshot,
             accountID: auth.accountID

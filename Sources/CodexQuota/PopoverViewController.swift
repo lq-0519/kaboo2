@@ -5,6 +5,12 @@ final class PopoverViewController: NSViewController {
   /// Shared store supplying live snapshots and accepting refresh settings.
   private let store: CodexQuotaStore
 
+  /// 在弹窗首屏展示今天和最近七个本地自然日观察到的七天额度消耗。
+  private let dailyQuotaUsageView = DailyQuotaUsageView()
+
+  /// 容纳整个弹窗的滚动视图，重新打开时定位到顶部的趋势图。
+  private let scrollView = NSScrollView()
+
   /// Five-hour quota view placed first to match the status-item order.
   private let fiveHourView = QuotaRowView()
 
@@ -86,7 +92,6 @@ final class PopoverViewController: NSViewController {
   override func loadView() {
     view = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 600))
 
-    let scrollView = NSScrollView()
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.drawsBackground = false
     scrollView.hasVerticalScroller = true
@@ -164,12 +169,15 @@ final class PopoverViewController: NSViewController {
     freshnessLabel.lineBreakMode = .byTruncatingTail
 
     let headerDivider = divider()
+    let dailyUsageDivider = divider()
     let fiveHourDivider = divider()
     let quotaDivider = divider()
     let footerDivider = divider()
     for arrangedView in [
       header,
       headerDivider,
+      dailyQuotaUsageView,
+      dailyUsageDivider,
       planSummaryView,
       fiveHourView,
       fiveHourDivider,
@@ -201,6 +209,7 @@ final class PopoverViewController: NSViewController {
       contentStack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -18),
       contentStack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -16),
       header.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+      dailyQuotaUsageView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       planSummaryView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       fiveHourView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       sevenDayView.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
@@ -209,6 +218,7 @@ final class PopoverViewController: NSViewController {
       creditsStack.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       freshnessLabel.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       headerDivider.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
+      dailyUsageDivider.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       fiveHourDivider.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       quotaDivider.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
       footerDivider.widthAnchor.constraint(equalTo: contentStack.widthAnchor),
@@ -244,7 +254,10 @@ final class PopoverViewController: NSViewController {
   /// content size before it is shown, without waking the hidden UI for background refreshes.
   func prepareForPresentation() {
     _ = view
+    store.refreshDailyQuotaUsageAccount()
     renderSnapshot()
+    scrollView.contentView.scroll(to: .zero)
+    scrollView.reflectScrolledClipView(scrollView.contentView)
   }
 
   /// Applies a store or clock update only while the popover is being presented.
@@ -259,6 +272,7 @@ final class PopoverViewController: NSViewController {
   /// 在面板可见更新或打开前准备时，同步额度、套餐说明、重置卡、刷新状态和内容高度。
   /// 仅在已有成功快照且缺少五小时窗口时显示套餐说明，避免将加载中或首次查询失败误判为无额度。
   private func renderSnapshot() {
+    dailyQuotaUsageView.update(days: store.recentDailyQuotaUsage())
     let snapshot = store.quotaSnapshot
     let showsPlanSummary = snapshot != nil && snapshot?.fiveHour == nil
     fiveHourView.isHidden = showsPlanSummary

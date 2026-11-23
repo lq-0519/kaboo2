@@ -10,6 +10,9 @@ struct CodexAuth {
 
   /// Absolute path of the Codex authentication file used to scope App Server.
   let authPath: String
+
+  /// 由当前登录用户和工作区生成的额度历史摘要。未请求或缺少用户标识时为空。
+  let quotaHistoryAccountKey: String?
 }
 
 /// Transient identity used only by opt-in credit consumption, without retaining an ID token.

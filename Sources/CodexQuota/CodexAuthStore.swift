@@ -11,8 +11,8 @@ final class CodexAuthStore {
     self.fileManager = fileManager
   }
 
-  /// Loads OAuth and workspace identifiers without retaining refresh tokens or ID tokens.
-  func load() throws -> CodexAuth {
+  /// 读取 OAuth 和工作区信息。额度查询可从同一次读取中提取历史账号摘要，且不会保留 ID token。
+  func load(includeQuotaHistoryIdentity: Bool = false) throws -> CodexAuth {
     guard let path = authenticationCandidates().first(where: fileManager.isReadableFile(atPath:))
     else {
       throw CodexQuotaError.notSignedIn
@@ -37,12 +37,24 @@ final class CodexAuthStore {
       throw CodexQuotaError.notSignedIn
     }
 
-    return CodexAuth(accessToken: accessToken, accountID: accountID, authPath: path)
+    var historyKey: String?
+    if includeQuotaHistoryIdentity,
+      let token = tokens["id_token"] as? String,
+      let claims = try? Self.identityClaims(from: token),
+      let subject = claims["sub"] as? String, !subject.isEmpty
+    {
+      historyKey = try? Self.accountKey(subject: subject, accountID: accountID)
+    }
+    return CodexAuth(
+      accessToken: accessToken,
+      accountID: accountID,
+      authPath: path,
+      quotaHistoryAccountKey: historyKey
+    )
   }
 
-  /// Reads identity claims only when automatic card use needs an account binding.
-  /// The ordinary quota reader still retains only access_token and account_id. ID-token bytes
-  /// are decoded transiently, never saved or logged; a missing user/email pauses card use.
+  /// 为自动用卡重新核对当前用户、邮箱和登录路径，缺少身份时暂停用卡。
+  /// ID token 只在解码期间使用，不写入记录或日志。
   func autoUseIdentity(for auth: CodexAuth) throws -> CodexAutoUseIdentity {
     let current = try load()
     guard current.accountID == auth.accountID, current.authPath == auth.authPath else {
@@ -57,14 +69,7 @@ final class CodexAuthStore {
     else {
       throw CodexQuotaError.transport("无法核对 Codex 登录身份，自动使用已暂停")
     }
-    let segments = token.split(separator: ".", omittingEmptySubsequences: false)
-    guard segments.count == 3 else { throw CodexQuotaError.invalidResponse }
-    var payload = String(segments[1])
-      .replacingOccurrences(of: "-", with: "+")
-      .replacingOccurrences(of: "_", with: "/")
-    payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
-    guard let decoded = Data(base64Encoded: payload),
-      let claims = try JSONSerialization.jsonObject(with: decoded) as? [String: Any],
+    guard let claims = try Self.identityClaims(from: token),
       let subject = claims["sub"] as? String, !subject.isEmpty,
       let email = claims["email"] as? String,
       !email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -72,12 +77,29 @@ final class CodexAuthStore {
       throw CodexQuotaError.transport("缺少 Codex 用户身份，自动使用已暂停")
     }
     let canonicalPath = URL(fileURLWithPath: auth.authPath).resolvingSymlinksInPath().path
-    let binding = try JSONSerialization.data(withJSONObject: [subject, auth.accountID])
-    let key = SHA256.hash(data: binding).map { String(format: "%02x", $0) }.joined()
+    let key = try Self.accountKey(subject: subject, accountID: auth.accountID)
     return CodexAutoUseIdentity(
       key: key, authPath: canonicalPath,
       email: email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     )
+  }
+
+  /// 临时解码本机登录文件的 ID token 声明，供提取账号摘要和核对用卡身份。
+  private static func identityClaims(from token: String) throws -> [String: Any]? {
+    let segments = token.split(separator: ".", omittingEmptySubsequences: false)
+    guard segments.count == 3 else { throw CodexQuotaError.invalidResponse }
+    var payload = String(segments[1])
+      .replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+    payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
+    guard let decoded = Data(base64Encoded: payload) else { return nil }
+    return try JSONSerialization.jsonObject(with: decoded) as? [String: Any]
+  }
+
+  /// 将用户和工作区组合为稳定摘要，共用已有用卡记录的摘要算法，不持久化原始标识。
+  private static func accountKey(subject: String, accountID: String) throws -> String {
+    let binding = try JSONSerialization.data(withJSONObject: [subject, accountID])
+    return SHA256.hash(data: binding).map { String(format: "%02x", $0) }.joined()
   }
 
   /// Returns the only authentication paths the app is permitted to inspect.
