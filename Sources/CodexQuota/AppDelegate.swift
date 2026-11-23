@@ -115,10 +115,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     stopPopoverDismissalMonitor()
   }
 
+  /// 显示器布局或可用区域变化时，按菜单栏按钮的新位置重新适配已打开的弹窗。
+  func applicationDidChangeScreenParameters(_ notification: Notification) {
+    renderVisiblePopover()
+  }
+
   /// Updates the always-visible status image and delegates popover refreshes to its visibility gate.
   private func render() {
     renderStatusItem()
-    popoverController.render()
+    renderVisiblePopover()
+  }
+
+  /// 仅更新已打开的弹窗，把重置卡等异步变化后的内容尺寸同步到原生弹窗。
+  private func renderVisiblePopover() {
+    guard popover.isShown, let button = statusItem.button else { return }
+    popoverController.render(maximumHeight: maximumPopoverHeight(below: button))
+    let preferredSize = popoverController.preferredContentSize
+    if popover.contentSize != preferredSize {
+      popover.contentSize = preferredSize
+    }
   }
 
   /// Renders available quota columns for one instant and skips image work when nothing visible changed.
@@ -225,7 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         forName: name, object: nil, queue: .main
       ) { [weak self] _ in
         self?.renderStatusItem()
-        self?.popoverController.render()
+        self?.renderVisiblePopover()
       }
       timeChangeObservers.append(observer)
     }
@@ -237,7 +252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     settingsWindowController.present()
   }
 
-  /// Opens or closes the transient popover relative to the status-item button.
+  /// 打开或关闭菜单栏弹窗。打开时先按按钮所在显示器下方的空间测量内容。
   @objc private func togglePopover() {
     guard let button = statusItem.button else {
       return
@@ -245,11 +260,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     if popover.isShown {
       popover.performClose(nil)
     } else {
-      popoverController.prepareForPresentation()
+      popoverController.prepareForPresentation(maximumHeight: maximumPopoverHeight(below: button))
       popover.contentSize = popoverController.preferredContentSize
-      popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+      let downwardEdge: NSRectEdge = button.isFlipped ? .maxY : .minY
+      popover.show(relativeTo: button.bounds, of: button, preferredEdge: downwardEdge)
       startPopoverDismissalMonitor()
     }
+  }
+
+  /// 从菜单栏按钮底边到当前显示器可用区域底边取垂直空间，并为弹窗箭头和边框留出余量。
+  private func maximumPopoverHeight(below button: NSView) -> CGFloat {
+    let window = button.window
+    guard let screen = window?.screen ?? NSScreen.main else { return 600 }
+    let visibleFrame = screen.visibleFrame
+    let anchor = window?.convertToScreen(button.convert(button.bounds, to: nil))
+    let top = min(anchor?.minY ?? visibleFrame.maxY, visibleFrame.maxY)
+    let chromeAllowance: CGFloat = 24
+    return max(1, floor(top - visibleFrame.minY - chromeAllowance))
   }
 
   /// Installs a mouse-only global monitor so clicks in other applications dismiss the popover.

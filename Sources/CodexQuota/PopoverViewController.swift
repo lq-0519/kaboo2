@@ -249,29 +249,26 @@ final class PopoverViewController: NSViewController {
     super.viewWillDisappear()
   }
 
-  /// Loads the native view once and synchronizes the latest retained data before presentation.
-  /// This explicit opening path may render while hidden so NSPopover receives the current
-  /// content size before it is shown, without waking the hidden UI for background refreshes.
-  func prepareForPresentation() {
+  /// 打开前加载最新快照，按显示器可用高度预先确定弹窗尺寸，并将内容滚回顶部。
+  func prepareForPresentation(maximumHeight: CGFloat) {
     _ = view
     store.refreshDailyQuotaUsageAccount()
-    renderSnapshot()
+    renderSnapshot(maximumHeight: maximumHeight)
     scrollView.contentView.scroll(to: .zero)
     scrollView.reflectScrolledClipView(scrollView.contentView)
   }
 
-  /// Applies a store or clock update only while the popover is being presented.
-  /// Hidden updates need no separate snapshot: the shared store remains the source of truth.
-  func render() {
+  /// 仅在面板显示期间同步最新数据和可用高度，后台刷新时无需测量隐藏界面。
+  func render(maximumHeight: CGFloat) {
     guard isPopoverVisible, isViewLoaded else {
       return
     }
-    renderSnapshot()
+    renderSnapshot(maximumHeight: maximumHeight)
   }
 
   /// 在面板可见更新或打开前准备时，同步额度、套餐说明、重置卡、刷新状态和内容高度。
   /// 仅在已有成功快照且缺少五小时窗口时显示套餐说明，避免将加载中或首次查询失败误判为无额度。
-  private func renderSnapshot() {
+  private func renderSnapshot(maximumHeight: CGFloat) {
     dailyQuotaUsageView.update(days: store.recentDailyQuotaUsage())
     let snapshot = store.quotaSnapshot
     let showsPlanSummary = snapshot != nil && snapshot?.fiveHour == nil
@@ -298,7 +295,7 @@ final class PopoverViewController: NSViewController {
     let quotaFreshness = DisplayFormatter.freshness(store.quotaSnapshot?.fetchedAt)
     let creditFreshness = DisplayFormatter.freshness(store.creditsSnapshot?.fetchedAt)
     freshnessLabel.stringValue = "额度 \(quotaFreshness) · 重置卡 \(creditFreshness)"
-    updatePreferredContentSize()
+    updatePreferredContentSize(maximumHeight: maximumHeight)
   }
 
   /// Creates a symbol-only command button with an explicit accessibility description.
@@ -369,13 +366,16 @@ final class PopoverViewController: NSViewController {
     return label
   }
 
-  /// Fits the popover to current content while preserving a bounded scrollable maximum height.
-  private func updatePreferredContentSize() {
+  /// 按内容自然高度展开到显示器允许的上限，超出的内容由原有滚动视图承载。
+  private func updatePreferredContentSize(maximumHeight: CGFloat) {
     view.layoutSubtreeIfNeeded()
     let verticalInsets: CGFloat = 32
     let requiredHeight = ceil(contentStack.fittingSize.height + verticalInsets)
-    let boundedHeight = min(600, max(260, requiredHeight))
-    preferredContentSize = NSSize(width: 380, height: boundedHeight)
+    let boundedHeight = min(maximumHeight, max(260, requiredHeight))
+    let size = NSSize(width: 380, height: boundedHeight)
+    if preferredContentSize != size {
+      preferredContentSize = size
+    }
   }
 
   /// Starts a coalescible one-second timer that changes only countdown strings.
