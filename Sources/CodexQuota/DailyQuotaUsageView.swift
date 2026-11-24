@@ -96,8 +96,8 @@ private final class DailyQuotaUsageChartView: NSView {
   /// 与每一列对应的用量、日期和采样完整状态，由旧到新排列。
   private var days: [DailyQuotaUsageDay] = []
 
-  /// 纵轴从零到最高日用量的 115%，上限为 100%。没有正用量时使用 1% 的占位范围。
-  private var axisMaximum: Double = 1
+  /// 纵轴上限为最高日用量加 15 个百分点，最多显示到 100%。暂无记录时以 0% 为基准。
+  private var axisMaximum: Double = 15
 
   /// 按本机时区生成简短日期标签和悬停信息，更新时读取当前时区。
   private var calendar: Calendar {
@@ -141,7 +141,7 @@ private final class DailyQuotaUsageChartView: NSView {
   func update(days: [DailyQuotaUsageDay]) {
     self.days = Array(days.suffix(columns.count))
     let maximum = self.days.compactMap(\.usedPercent).max() ?? 0
-    axisMaximum = maximum > 0 ? min(100, maximum * 1.15) : 1
+    axisMaximum = min(100, maximum + 15)
 
     for (index, column) in columns.enumerated() {
       let description = self.days.indices.contains(index) ? dayDescription(at: index) : nil
@@ -175,13 +175,10 @@ private final class DailyQuotaUsageChartView: NSView {
       NSColor.separatorColor.setStroke()
       line.lineWidth = 1
       line.stroke()
-      // 数值太小时只标注两端，避免一位小数的中间刻度显示为重复值。
-      if axisMaximum >= 0.4 || index == 0 || index == 4 {
-        drawText(
-          DailyQuotaUsageView.percent(tick), font: axisFont, color: .secondaryLabelColor,
-          alignedAt: NSPoint(x: plot.minX - 5, y: y), rightAligned: true
-        )
-      }
+      drawText(
+        DailyQuotaUsageView.percent(tick), font: axisFont, color: .secondaryLabelColor,
+        alignedAt: NSPoint(x: plot.minX - 5, y: y), rightAligned: true
+      )
     }
 
     let width = plot.width / CGFloat(columns.count)
