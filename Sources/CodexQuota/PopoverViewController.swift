@@ -90,7 +90,7 @@ final class PopoverViewController: NSViewController {
 
   /// Builds the scrollable, full-width data surface with no nested page cards.
   override func loadView() {
-    view = PopoverSurfaceView(frame: NSRect(x: 0, y: 0, width: 380, height: 600))
+    view = PopoverTintView(frame: NSRect(x: 0, y: 0, width: 380, height: 600))
 
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.drawsBackground = false
@@ -414,18 +414,15 @@ final class PopoverViewController: NSViewController {
   }
 }
 
-/// 在原生弹窗内绘制稳定底色，滚动时也让所有内容与后方窗口隔离。
-private final class PopoverSurfaceView: NSView {
-  /// 界面内容区域完全覆盖，AppKit 无需合成此区域下方的半透明内容。
-  override var isOpaque: Bool { true }
-
-  /// 按视图的当前外观填充需要更新的区域。
+/// 在原生弹窗的毛玻璃上叠加色调，露出背景模糊并维持内容的辨识度。
+private final class PopoverTintView: NSView {
+  /// 将当前外观的半透明色调绘制到需要更新的区域，由 AppKit 与原生材质合成。
   override func draw(_ dirtyRect: NSRect) {
-    QuotaPopoverColors.background.setFill()
+    QuotaPopoverColors.backdropTint.setFill()
     NSBezierPath(rect: dirtyRect).fill()
   }
 
-  /// 系统外观切换后重画底色，避免沿用上一个外观的绘制结果。
+  /// 系统外观切换后按新的颜色和不透明度重画色调。
   override func viewDidChangeEffectiveAppearance() {
     super.viewDidChangeEffectiveAppearance()
     needsDisplay = true
