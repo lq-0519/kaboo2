@@ -96,8 +96,8 @@ private final class DailyQuotaUsageChartView: NSView {
   /// 与每一列对应的用量、日期和采样完整状态，由旧到新排列。
   private var days: [DailyQuotaUsageDay] = []
 
-  /// 纵轴上限为最高日用量加 15 个百分点，最多显示到 100%。暂无记录时以 0% 为基准。
-  private var axisMaximum: Double = 15
+  /// 纵轴上限为最高日用量加 5 个百分点，最多显示到 100%。暂无记录时以 0% 为基准。
+  private var axisMaximum: Double = 5
 
   /// 按本机时区生成简短日期标签和悬停信息，更新时读取当前时区。
   private var calendar: Calendar {
@@ -141,7 +141,7 @@ private final class DailyQuotaUsageChartView: NSView {
   func update(days: [DailyQuotaUsageDay]) {
     self.days = Array(days.suffix(columns.count))
     let maximum = self.days.compactMap(\.usedPercent).max() ?? 0
-    axisMaximum = min(100, maximum + 15)
+    axisMaximum = min(100, maximum + 5)
 
     for (index, column) in columns.enumerated() {
       let description = self.days.indices.contains(index) ? dayDescription(at: index) : nil
