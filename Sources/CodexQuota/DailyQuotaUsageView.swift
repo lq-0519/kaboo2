@@ -96,11 +96,8 @@ private final class DailyQuotaUsageChartView: NSView {
   /// 与每一列对应的用量、日期和采样完整状态，由旧到新排列。
   private var days: [DailyQuotaUsageDay] = []
 
-  /// 刻度步长按最大日用量扩展，正常范围按 25 个百分点一格。
-  private var tickStep: Double = 25
-
-  /// 纵轴真实上界，允许同一天消耗的额度比例超过 100%。
-  private var axisMaximum: Double = 100
+  /// 纵轴从零到最高日用量的 115%，上限为 100%。没有正用量时使用 1% 的占位范围。
+  private var axisMaximum: Double = 1
 
   /// 按本机时区生成简短日期标签和悬停信息，更新时读取当前时区。
   private var calendar: Calendar {
@@ -144,8 +141,7 @@ private final class DailyQuotaUsageChartView: NSView {
   func update(days: [DailyQuotaUsageDay]) {
     self.days = Array(days.suffix(columns.count))
     let maximum = self.days.compactMap(\.usedPercent).max() ?? 0
-    tickStep = maximum <= 100 ? 25 : 50 * ceil(maximum / 200)
-    axisMaximum = max(100, ceil(maximum / tickStep) * tickStep)
+    axisMaximum = maximum > 0 ? min(100, maximum * 1.15) : 1
 
     for (index, column) in columns.enumerated() {
       let description = self.days.indices.contains(index) ? dayDescription(at: index) : nil
@@ -169,18 +165,23 @@ private final class DailyQuotaUsageChartView: NSView {
     guard plot.width > 0, plot.height > 0 else { return }
 
     let axisFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-    for tick in stride(from: 0.0, through: axisMaximum, by: tickStep) {
-      let y = (plot.minY + plot.height * CGFloat(tick / axisMaximum)).rounded() + 0.5
+    for index in 0...4 {
+      let fraction = Double(index) / 4
+      let tick = axisMaximum * fraction
+      let y = (plot.minY + plot.height * CGFloat(fraction)).rounded() + 0.5
       let line = NSBezierPath()
       line.move(to: NSPoint(x: plot.minX, y: y))
       line.line(to: NSPoint(x: plot.maxX, y: y))
       NSColor.separatorColor.setStroke()
       line.lineWidth = 1
       line.stroke()
-      drawText(
-        DailyQuotaUsageView.percent(tick), font: axisFont, color: .secondaryLabelColor,
-        alignedAt: NSPoint(x: plot.minX - 5, y: y), rightAligned: true
-      )
+      // 数值太小时只标注两端，避免一位小数的中间刻度显示为重复值。
+      if axisMaximum >= 0.4 || index == 0 || index == 4 {
+        drawText(
+          DailyQuotaUsageView.percent(tick), font: axisFont, color: .secondaryLabelColor,
+          alignedAt: NSPoint(x: plot.minX - 5, y: y), rightAligned: true
+        )
+      }
     }
 
     let width = plot.width / CGFloat(columns.count)
@@ -194,7 +195,8 @@ private final class DailyQuotaUsageChartView: NSView {
       drawText(dateText, font: dateFont, color: textColor, alignedAt: NSPoint(x: x, y: 7))
 
       guard let value = day.usedPercent else { continue }
-      let height = max(2, plot.height * CGFloat(value / axisMaximum))
+      // 同日多次重置可能使总用量超过 100%，柱高封顶，柱上文字仍显示实际值。
+      let height = max(2, plot.height * CGFloat(min(value, axisMaximum) / axisMaximum))
       let barWidth = min(20, width * 0.55)
       let bar = NSRect(x: x - barWidth / 2, y: plot.minY, width: barWidth, height: height)
       let barColor: NSColor = isToday ? .controlAccentColor : .secondaryLabelColor
