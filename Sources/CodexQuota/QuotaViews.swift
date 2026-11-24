@@ -71,15 +71,15 @@ final class QuotaRowView: NSView {
     translatesAutoresizingMaskIntoConstraints = false
 
     titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-    titleLabel.textColor = .labelColor
+    titleLabel.textColor = QuotaPopoverColors.primaryText
     percentLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
-    percentLabel.textColor = .labelColor
+    percentLabel.textColor = QuotaPopoverColors.primaryText
     percentLabel.alignment = .right
 
     countdownLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-    countdownLabel.textColor = .secondaryLabelColor
+    countdownLabel.textColor = QuotaPopoverColors.secondaryText
     exactLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-    exactLabel.textColor = .tertiaryLabelColor
+    exactLabel.textColor = QuotaPopoverColors.secondaryText
 
     let heading = NSStackView(views: [titleLabel, NSView(), percentLabel])
     heading.orientation = .horizontal
@@ -145,21 +145,21 @@ final class QuotaRowView: NSView {
   }
 }
 
-/// Rounded repeated item used only for an individual reset credit.
+/// 在弹窗内展示一张重置卡的名称、到期倒计时和准确时间。
 final class ResetCreditRowView: NSView {
-  /// Backend display title for the credit.
+  /// 服务返回的卡片名称，过长时只截短末尾。
   private let titleLabel = NSTextField(labelWithString: "")
 
-  /// Relative expiry countdown updated locally while visible.
+  /// 右侧到期倒计时，弹窗可见时在本地更新。
   private let countdownLabel = NSTextField(labelWithString: "")
 
-  /// Absolute expiry timestamp in the current timezone.
+  /// 第二行展示当前时区下的准确到期时间。
   private let exactLabel = NSTextField(labelWithString: "")
 
-  /// Credit model retained for efficient one-second countdown updates.
+  /// 卡片数据用于计算倒计时，更新文字时无需重建视图。
   private let credit: ResetCredit
 
-  /// Creates one bounded-height reset-credit card.
+  /// 将名称和倒计时放在同一行，准确时间单独排在下方。
   init(credit: ResetCredit) {
     self.credit = credit
     super.init(frame: .zero)
@@ -167,54 +167,66 @@ final class ResetCreditRowView: NSView {
 
     titleLabel.stringValue = credit.title
     titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
-    titleLabel.textColor = .labelColor
+    titleLabel.textColor = QuotaPopoverColors.primaryText
     titleLabel.lineBreakMode = .byTruncatingTail
     titleLabel.maximumNumberOfLines = 1
+    titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
     countdownLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-    countdownLabel.textColor = .secondaryLabelColor
+    countdownLabel.textColor = QuotaPopoverColors.primaryText
+    countdownLabel.alignment = .right
+    countdownLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
     exactLabel.stringValue =
       credit.expiresAt.map {
         "到期：\(DisplayFormatter.exact($0))"
       } ?? "无到期时间"
     exactLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-    exactLabel.textColor = .tertiaryLabelColor
+    exactLabel.textColor = QuotaPopoverColors.secondaryText
 
-    let stack = NSStackView(views: [titleLabel, countdownLabel, exactLabel])
+    let spacer = NSView()
+    spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    let heading = NSStackView(views: [titleLabel, spacer, countdownLabel])
+    heading.orientation = .horizontal
+    heading.alignment = .firstBaseline
+    heading.spacing = 5
+
+    let stack = NSStackView(views: [heading, exactLabel])
     stack.orientation = .vertical
     stack.alignment = .leading
-    stack.spacing = 4
+    stack.spacing = 3
     stack.translatesAutoresizingMaskIntoConstraints = false
     addSubview(stack)
 
     NSLayoutConstraint.activate([
-      stack.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-      stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-      stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-      stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-      heightAnchor.constraint(greaterThanOrEqualToConstant: 72),
+      stack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+      stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+      stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+      stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+      heading.widthAnchor.constraint(equalTo: stack.widthAnchor),
     ])
     updateCountdown()
   }
 
-  /// Prevents construction from archived interface files because the app is fully programmatic.
+  /// 卡片由代码创建，不支持从归档界面初始化。
   required init?(coder: NSCoder) {
     fatalError("init(coder:) is not supported")
   }
 
-  /// Draws an adaptive neutral card with the required eight-point radius.
+  /// 绘制与弹窗底色接近的圆角背景，使用一个物理像素宽的细边框。
   override func draw(_ dirtyRect: NSRect) {
-    NSColor.controlBackgroundColor.setFill()
-    let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
-    path.fill()
-    NSColor.separatorColor.setStroke()
-    path.lineWidth = 1
-    path.stroke()
     super.draw(dirtyRect)
+    let borderWidth = 1 / (window?.backingScaleFactor ?? 1)
+    let inset = borderWidth / 2
+    let path = NSBezierPath(roundedRect: bounds.insetBy(dx: inset, dy: inset), xRadius: 8, yRadius: 8)
+    QuotaPopoverColors.cardBackground.setFill()
+    path.fill()
+    QuotaPopoverColors.border.setStroke()
+    path.lineWidth = borderWidth
+    path.stroke()
   }
 
-  /// Recomputes the relative expiry label without changing card geometry.
+  /// 只更新当前倒计时文字，保留卡片视图和已布局的时间字段。
   func updateCountdown(now: Date = Date()) {
     countdownLabel.stringValue = DisplayFormatter.expiryCountdown(
       until: credit.expiresAt,

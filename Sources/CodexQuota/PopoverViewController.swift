@@ -90,7 +90,7 @@ final class PopoverViewController: NSViewController {
 
   /// Builds the scrollable, full-width data surface with no nested page cards.
   override func loadView() {
-    view = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: 600))
+    view = PopoverSurfaceView(frame: NSRect(x: 0, y: 0, width: 380, height: 600))
 
     scrollView.translatesAutoresizingMaskIntoConstraints = false
     scrollView.drawsBackground = false
@@ -105,7 +105,7 @@ final class PopoverViewController: NSViewController {
 
     let titleLabel = NSTextField(labelWithString: "Codex 用量")
     titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
-    titleLabel.textColor = .labelColor
+    titleLabel.textColor = QuotaPopoverColors.primaryText
 
     progressIndicator.style = .spinning
     progressIndicator.controlSize = .small
@@ -134,10 +134,10 @@ final class PopoverViewController: NSViewController {
     quotaErrorLabel.isHidden = true
 
     planLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-    planLabel.textColor = .labelColor
+    planLabel.textColor = QuotaPopoverColors.primaryText
     let noFiveHourLabel = NSTextField(labelWithString: "无 5 小时额度")
     noFiveHourLabel.font = .systemFont(ofSize: 12)
-    noFiveHourLabel.textColor = .secondaryLabelColor
+    noFiveHourLabel.textColor = QuotaPopoverColors.secondaryText
     planSummaryView.orientation = .vertical
     planSummaryView.alignment = .leading
     planSummaryView.spacing = 6
@@ -147,8 +147,9 @@ final class PopoverViewController: NSViewController {
 
     let creditsTitle = NSTextField(labelWithString: "重置卡")
     creditsTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+    creditsTitle.textColor = QuotaPopoverColors.primaryText
     creditsCountLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
-    creditsCountLabel.textColor = .secondaryLabelColor
+    creditsCountLabel.textColor = QuotaPopoverColors.secondaryText
     creditsCountLabel.alignment = .right
 
     let creditsSpacer = NSView()
@@ -165,7 +166,7 @@ final class PopoverViewController: NSViewController {
     creditsStack.spacing = 8
 
     freshnessLabel.font = .monospacedDigitSystemFont(ofSize: 10, weight: .regular)
-    freshnessLabel.textColor = .tertiaryLabelColor
+    freshnessLabel.textColor = QuotaPopoverColors.secondaryText
     freshnessLabel.lineBreakMode = .byTruncatingTail
 
     let headerDivider = divider()
@@ -303,6 +304,7 @@ final class PopoverViewController: NSViewController {
     let button = NSButton()
     button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tooltip)
     button.imagePosition = .imageOnly
+    button.contentTintColor = QuotaPopoverColors.accentText
     button.bezelStyle = .texturedRounded
     button.isBordered = true
     button.controlSize = .small
@@ -362,7 +364,7 @@ final class PopoverViewController: NSViewController {
   private func mutedLabel(_ text: String) -> NSTextField {
     let label = NSTextField(wrappingLabelWithString: text)
     label.font = .systemFont(ofSize: 11)
-    label.textColor = .secondaryLabelColor
+    label.textColor = QuotaPopoverColors.secondaryText
     return label
   }
 
@@ -409,5 +411,23 @@ final class PopoverViewController: NSViewController {
   /// Terminates the accessory application without leaving a status item behind.
   @objc private func quitClicked() {
     NSApplication.shared.terminate(nil)
+  }
+}
+
+/// 在原生弹窗内绘制稳定底色，滚动时也让所有内容与后方窗口隔离。
+private final class PopoverSurfaceView: NSView {
+  /// 界面内容区域完全覆盖，AppKit 无需合成此区域下方的半透明内容。
+  override var isOpaque: Bool { true }
+
+  /// 按视图的当前外观填充需要更新的区域。
+  override func draw(_ dirtyRect: NSRect) {
+    QuotaPopoverColors.background.setFill()
+    NSBezierPath(rect: dirtyRect).fill()
+  }
+
+  /// 系统外观切换后重画底色，避免沿用上一个外观的绘制结果。
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    needsDisplay = true
   }
 }

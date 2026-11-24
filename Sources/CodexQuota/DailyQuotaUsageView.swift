@@ -1,6 +1,6 @@
 import AppKit
 
-/// 展示今日额度消耗和最近七个本地自然日的柱状图，使用系统颜色适配浅色和深色外观。
+/// 展示今日额度消耗和最近七个本地自然日的柱状图，使用弹窗配色适配浅色和深色外观。
 final class DailyQuotaUsageView: NSView {
   /// 今日用量入口始终和历史图表同屏，缺少有效样本时显示暂无数据。
   private let todayLabel = NSTextField(labelWithString: "今日暂无数据")
@@ -14,17 +14,19 @@ final class DailyQuotaUsageView: NSView {
   /// 保留上次渲染的数据，避免重置卡刷新等无关更新触发图表重绘。
   private var days: [DailyQuotaUsageDay] = []
 
-  /// 构建紧凑的历史区，使用和下方额度行一致的字号与自适应布局。
+  /// 构建紧凑的历史区，使用弹窗配色区分标题、今日摘要和统计说明。
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
     translatesAutoresizingMaskIntoConstraints = false
 
     let title = NSTextField(labelWithString: "7 天额度消耗趋势")
-    title.font = .systemFont(ofSize: 13, weight: .semibold)
-    todayLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+    title.font = .systemFont(ofSize: 14, weight: .semibold)
+    title.textColor = QuotaPopoverColors.primaryText
+    todayLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .semibold)
+    todayLabel.textColor = QuotaPopoverColors.secondaryText
     todayLabel.alignment = .right
     detailLabel.font = .systemFont(ofSize: 11)
-    detailLabel.textColor = .secondaryLabelColor
+    detailLabel.textColor = QuotaPopoverColors.secondaryText
 
     let heading = NSStackView(views: [title, NSView(), todayLabel])
     heading.orientation = .horizontal
@@ -61,10 +63,10 @@ final class DailyQuotaUsageView: NSView {
 
     if let today = days.last?.usedPercent {
       todayLabel.stringValue = "今日已用约 \(Self.percent(today))"
-      todayLabel.textColor = .labelColor
+      todayLabel.textColor = QuotaPopoverColors.accentText
     } else {
       todayLabel.stringValue = "今日暂无数据"
-      todayLabel.textColor = .secondaryLabelColor
+      todayLabel.textColor = QuotaPopoverColors.secondaryText
     }
 
     if !days.contains(where: { $0.usedPercent != nil }) {
@@ -87,8 +89,8 @@ final class DailyQuotaUsageView: NSView {
 
 /// 绘制同一纵轴上的七个日用量柱，每列使用原生提示和辅助功能标签提供完整数值。
 private final class DailyQuotaUsageChartView: NSView {
-  /// 保留左侧刻度列，绘图与原生提示热区共享同一宽度。
-  private let axisWidth: CGFloat = 39
+  /// 给较大的百分比刻度预留空间，绘图和原生提示热区使用同一列宽。
+  private let axisWidth: CGFloat = 44
 
   /// 每日一项的提示和 VoiceOver 热区，由固定列布局平均分配屏幕宽度。
   private let columns = (0..<7).map { _ in NSView() }
@@ -158,13 +160,14 @@ private final class DailyQuotaUsageChartView: NSView {
     needsDisplay = true
   }
 
-  /// 绘制共用百分比刻度、每天的柱和值。缺失列留空，已知的零在基线上标记。
+  /// 绘制共用百分比刻度、每天的柱和值。刻度和日期保持清晰，今日使用强调色。
+  /// 缺失列留空，已知的零在基线上标记，不完整的柱用较浅的填充色区分。
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
     let plot = NSRect(x: axisWidth, y: 17, width: bounds.width - axisWidth, height: bounds.height - 36)
     guard plot.width > 0, plot.height > 0 else { return }
 
-    let axisFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+    let axisFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
     for index in 0...4 {
       let fraction = Double(index) / 4
       let tick = axisMaximum * fraction
@@ -172,11 +175,11 @@ private final class DailyQuotaUsageChartView: NSView {
       let line = NSBezierPath()
       line.move(to: NSPoint(x: plot.minX, y: y))
       line.line(to: NSPoint(x: plot.maxX, y: y))
-      NSColor.separatorColor.setStroke()
+      QuotaPopoverColors.border.withAlphaComponent(index == 0 ? 1 : 0.70).setStroke()
       line.lineWidth = 1
       line.stroke()
       drawText(
-        DailyQuotaUsageView.percent(tick), font: axisFont, color: .secondaryLabelColor,
+        DailyQuotaUsageView.percent(tick), font: axisFont, color: QuotaPopoverColors.secondaryText,
         alignedAt: NSPoint(x: plot.minX - 5, y: y), rightAligned: true
       )
     }
@@ -187,22 +190,23 @@ private final class DailyQuotaUsageChartView: NSView {
       let x = plot.minX + width * (CGFloat(index) + 0.5)
       let date = calendar.dateComponents([.month, .day], from: day.date)
       let dateText = isToday ? "今天" : "\(date.month ?? 0)/\(date.day ?? 0)"
-      let dateFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: isToday ? .semibold : .regular)
-      let textColor: NSColor = isToday ? .controlAccentColor : .secondaryLabelColor
-      drawText(dateText, font: dateFont, color: textColor, alignedAt: NSPoint(x: x, y: 7))
+      let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: isToday ? .semibold : .medium)
+      let dateColor = isToday ? QuotaPopoverColors.accentText : QuotaPopoverColors.secondaryText
+      drawText(dateText, font: font, color: dateColor, alignedAt: NSPoint(x: x, y: 7))
 
       guard let value = day.usedPercent else { continue }
       // 同日多次重置可能使总用量超过 100%，柱高封顶，柱上文字仍显示实际值。
       let height = max(2, plot.height * CGFloat(min(value, axisMaximum) / axisMaximum))
-      let barWidth = min(20, width * 0.55)
+      let barWidth = min(22, width * 0.59)
       let bar = NSRect(x: x - barWidth / 2, y: plot.minY, width: barWidth, height: height)
-      let barColor: NSColor = isToday ? .controlAccentColor : .secondaryLabelColor
-      barColor.withAlphaComponent(day.isPartial ? 0.30 : 0.75).setFill()
+      let barColor = isToday ? QuotaPopoverColors.todayBar : QuotaPopoverColors.historyBar
+      barColor.withAlphaComponent(day.isPartial ? 0.74 : 1).setFill()
       let corner = min(3, height / 2)
       NSBezierPath(roundedRect: bar, xRadius: corner, yRadius: corner).fill()
+      let valueColor = isToday ? QuotaPopoverColors.accentText : QuotaPopoverColors.primaryText
       drawText(
-        DailyQuotaUsageView.percent(value), font: dateFont, color: textColor,
-        alignedAt: NSPoint(x: x, y: bar.maxY + 8)
+        DailyQuotaUsageView.percent(value), font: font, color: valueColor,
+        alignedAt: NSPoint(x: x, y: bar.maxY + 9)
       )
     }
   }
