@@ -138,7 +138,7 @@ enum DisplayFormatter {
     return exactDateFormatter.string(from: date)
   }
 
-  /// Formats a quota reset as a live, second-resolution relative countdown.
+  /// 显示距离额度重置的剩余时间，精确到分钟。
   static func resetCountdown(until date: Date?, now: Date = Date()) -> String {
     guard let date else {
       return "重置时间未知"
@@ -149,7 +149,7 @@ enum DisplayFormatter {
     return "还有 \(duration(from: now, to: date))"
   }
 
-  /// Formats a reset-credit expiry as a live, second-resolution relative countdown.
+  /// 显示距离重置卡到期的剩余时间，精确到分钟。
   static func expiryCountdown(until date: Date?, now: Date = Date()) -> String {
     guard let date else {
       return "长期有效"
@@ -169,15 +169,16 @@ enum DisplayFormatter {
     return "更新于 \(clockFormatter.string(from: date))"
   }
 
-  /// Produces a compact duration with days, hours, minutes, and a zero-padded second.
+  /// 按整分钟拆分剩余时间，保留天、小时和分钟。最后一分钟单独显示，避免仍有效时显示 0 分。
   private static func duration(from start: Date, to end: Date) -> String {
-    var seconds = max(0, Int(end.timeIntervalSince(start)))
-    let days = seconds / 86_400
-    seconds %= 86_400
-    let hours = seconds / 3_600
-    seconds %= 3_600
-    let minutes = seconds / 60
-    let remainder = seconds % 60
+    let totalMinutes = Int(end.timeIntervalSince(start) / 60)
+    guard totalMinutes > 0 else {
+      return "不足 1 分钟"
+    }
+
+    let days = totalMinutes / 1_440
+    let hours = totalMinutes / 60 % 24
+    let minutes = totalMinutes % 60
 
     var parts: [String] = []
     if days > 0 {
@@ -186,10 +187,7 @@ enum DisplayFormatter {
     if hours > 0 || days > 0 {
       parts.append("\(hours)小时")
     }
-    if minutes > 0 || hours > 0 || days > 0 {
-      parts.append("\(minutes)分")
-    }
-    parts.append(String(format: "%02d秒", remainder))
+    parts.append("\(minutes)分")
     return parts.joined(separator: " ")
   }
 }
