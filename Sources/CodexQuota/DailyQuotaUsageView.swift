@@ -71,8 +71,6 @@ final class DailyQuotaUsageView: NSView {
 
     if !days.contains(where: { $0.usedPercent != nil }) {
       detailLabel.stringValue = "按一轮 7 天额度统计，等待积累用量记录"
-    } else if days.contains(where: { $0.usedPercent != nil && $0.isPartial }) {
-      detailLabel.stringValue = "按一轮 7 天额度统计，淡色表示记录不完整"
     } else {
       detailLabel.stringValue = "按一轮 7 天额度统计"
     }
@@ -95,7 +93,7 @@ private final class DailyQuotaUsageChartView: NSView {
   /// 每日一项的提示和 VoiceOver 热区，由固定列布局平均分配屏幕宽度。
   private let columns = (0..<7).map { _ in NSView() }
 
-  /// 与每一列对应的用量、日期和采样完整状态，由旧到新排列。
+  /// 与每一列对应的用量和日期，由旧到新排列。
   private var days: [DailyQuotaUsageDay] = []
 
   /// 纵轴上限为最高日用量加 5 个百分点，最多显示到 100%。暂无记录时以 0% 为基准。
@@ -161,7 +159,7 @@ private final class DailyQuotaUsageChartView: NSView {
   }
 
   /// 绘制共用百分比刻度、每天的柱和值。刻度和日期保持清晰，今日使用强调色。
-  /// 缺失列留空，已知的零在基线上标记，不完整的柱用较浅的填充色区分。
+  /// 历史柱统一着色，缺失列留空，已知的零在基线上标记。
   override func draw(_ dirtyRect: NSRect) {
     super.draw(dirtyRect)
     let plot = NSRect(x: axisWidth, y: 17, width: bounds.width - axisWidth, height: bounds.height - 36)
@@ -200,7 +198,7 @@ private final class DailyQuotaUsageChartView: NSView {
       let barWidth = min(22, width * 0.59)
       let bar = NSRect(x: x - barWidth / 2, y: plot.minY, width: barWidth, height: height)
       let barColor = isToday ? QuotaPopoverColors.todayBar : QuotaPopoverColors.historyBar
-      barColor.withAlphaComponent(day.isPartial ? 0.74 : 1).setFill()
+      barColor.setFill()
       let corner = min(3, height / 2)
       NSBezierPath(roundedRect: bar, xRadius: corner, yRadius: corner).fill()
       let valueColor = isToday ? QuotaPopoverColors.accentText : QuotaPopoverColors.primaryText
@@ -211,14 +209,13 @@ private final class DailyQuotaUsageChartView: NSView {
     }
   }
 
-  /// 生成悬停和 VoiceOver 共用的日期、观察用量与完整状态说明。
+  /// 生成悬停和 VoiceOver 共用的日期与观测用量说明。
   private func dayDescription(at index: Int) -> String {
     let day = days[index]
     let date = calendar.dateComponents([.month, .day], from: day.date)
     let dateText = "\(date.month ?? 0)月\(date.day ?? 0)日"
     guard let value = day.usedPercent else { return "\(dateText)，暂无数据" }
-    let partial = day.isPartial ? "，记录不完整" : ""
-    return "\(dateText)，已用约 \(DailyQuotaUsageView.percent(value))\(partial)"
+    return "\(dateText)，已用约 \(DailyQuotaUsageView.percent(value))"
   }
 
   /// 把坐标文字垂直居中，轴标签右对齐，日标签和用量在柱的水平中点居中。

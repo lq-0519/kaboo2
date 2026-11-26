@@ -8,9 +8,6 @@ struct DailyQuotaUsageDay: Equatable {
 
   /// 当天已观察到的消耗，单位为一轮 7 天额度的百分比。
   let usedPercent: Double?
-
-  /// 记录覆盖不完整，已统计的消耗可能低于实际消耗。
-  let isPartial: Bool
 }
 
 /// 从现有额度快照累计每日用量。主线程更新内存状态，后台队列串行保存紧凑账本。
@@ -257,10 +254,7 @@ final class DailyQuotaUsageHistory {
     return (0..<Self.displayDays).reversed().compactMap { offset in
       guard let date = calendar.date(byAdding: .day, value: -offset, to: today) else { return nil }
       let key = Self.dayKey(date, calendar: calendar)
-      let total = account?.days[key]
-      return DailyQuotaUsageDay(
-        date: date, usedPercent: total?.usedPercent, isPartial: total?.isPartial ?? false
-      )
+      return DailyQuotaUsageDay(date: date, usedPercent: account?.days[key]?.usedPercent)
     }
   }
 

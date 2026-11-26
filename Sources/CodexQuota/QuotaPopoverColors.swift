@@ -23,8 +23,8 @@ enum QuotaPopoverColors {
   /// 今日柱的强调蓝，与历史柱保持区别。
   static let todayBar = adaptive(light: 0x2e6bc7, dark: 0x80b5ff)
 
-  /// 历史柱使用低饱和度的蓝灰色，保留与图表底色的明度差。
-  static let historyBar = adaptive(light: 0x57718e, dark: 0x91a9c8)
+  /// 每根历史柱统一使用蓝灰实色，并按系统外观选择清晰可见的明度。
+  static let historyBar = adaptive(light: 0x4c647e, dark: 0x7892af)
 
   /// 由 AppKit 按视图当前外观解析 sRGB 色值和各自的不透明度，默认生成实色。
   private static func adaptive(
